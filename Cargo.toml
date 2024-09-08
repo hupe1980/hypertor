@@ -7,7 +7,7 @@ repository = "https://github.com/hupe1980/hypertor"
 license = "MIT"
 description = "Rust library for HTTP requests over Tor, supporting HTTP/HTTPS with configurable TLS via hyper and arti_client."
 keywords = ["tor", "http", "client", "requests"]
-categories = ["network-programming", "web"]
+categories = ["network-programming", "web-programming::http-client"]
 publish = true
 
 [dependencies]
