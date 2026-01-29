@@ -70,21 +70,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux - manylinux for broad compatibility
+          # Linux x86_64 - native build
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             compatibility: manylinux2014
+            use_zig: false
+          # Linux ARM64 - cross-compile with zig
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             compatibility: manylinux2014
+            use_zig: true
           # macOS (Apple Silicon only)
           - os: macos-latest
             target: aarch64-apple-darwin
             compatibility: ''
+            use_zig: false
           # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             compatibility: ''
+            use_zig: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -97,11 +102,22 @@ jobs:
       - name: Install maturin
         run: pip install maturin
       
+      # Install zig for cross-compilation (ARM64 Linux from x86_64)
+      - name: Install zig
+        if: matrix.use_zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.11.0
+      
       # Use rustls (python feature implies rustls default) - no OpenSSL needed
       # Windows needs static-sqlite since SQLite isn't available as a system library
-      - name: Build wheels (Linux)
-        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
-        run: maturin build --release --features python --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }}
+      - name: Build wheels (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: maturin build --release --features python --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} -i python3.11
+      
+      - name: Build wheels (Linux ARM64 cross-compile)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: maturin build --release --features python --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} --zig -i python3.11
       
       - name: Build wheels (macOS)
         if: endsWith(matrix.target, 'apple-darwin')
