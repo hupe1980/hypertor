@@ -39,6 +39,9 @@ http2 = []
 # Privacy features
 padding = []
 
+# Static linking (useful for Windows where system SQLite isn't available)
+static-sqlite = ["arti-client/static-sqlite"]
+
 # Python bindings
 python = ["dep:pyo3", "dep:pyo3-async-runtimes"]
 

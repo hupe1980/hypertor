@@ -47,8 +47,14 @@ jobs:
         run: sudo apt-get install -y musl-tools
       
       # Use rustls features (no OpenSSL needed) for cross-platform builds
-      - name: Build
+      # Windows needs static-sqlite since SQLite isn't available as a system library
+      - name: Build (non-Windows)
+        if: matrix.target != 'x86_64-pc-windows-msvc'
         run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls"
+      
+      - name: Build (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls,static-sqlite"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -97,8 +103,14 @@ jobs:
         run: pip install maturin
       
       # Use rustls (python feature implies rustls default) - no OpenSSL needed
-      - name: Build wheels
+      # Windows needs static-sqlite since SQLite isn't available as a system library
+      - name: Build wheels (non-Windows)
+        if: matrix.target != 'x86_64-pc-windows-msvc'
         run: maturin build --release --features python --target ${{ matrix.target }} --manylinux ${{ matrix.manylinux }}
+      
+      - name: Build wheels (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: maturin build --release --features "python,static-sqlite" --target ${{ matrix.target }} --manylinux ${{ matrix.manylinux }}
       
       - name: Upload wheels
         uses: actions/upload-artifact@v4

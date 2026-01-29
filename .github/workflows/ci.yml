@@ -72,8 +72,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       
       # Run tests with rustls (default) - works on all platforms without system deps
+      # Windows needs static-sqlite since SQLite isn't available as a system library
       - name: Run tests (rustls)
+        if: matrix.os != 'windows-latest'
         run: cargo test --features "client,server,http2,padding,rustls" --workspace
+      
+      - name: Run tests (rustls + static-sqlite)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --features "client,server,http2,padding,rustls,static-sqlite" --workspace
       
       # On Linux/macOS, also test native-tls (requires OpenSSL)
       - name: Run tests (native-tls)
@@ -81,6 +87,7 @@ jobs:
         run: cargo test --no-default-features --features "client,server,http2,padding,native-tls" --workspace
       
       - name: Run tests (no default features)
+        if: matrix.os != 'windows-latest'
         run: cargo test --no-default-features
 
   # ============================================================================
