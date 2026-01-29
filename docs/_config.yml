@@ -1,0 +1,83 @@
+# hypertor Documentation Site
+
+title: hypertor
+description: "The Tor network library for Rust and Python — consume AND host onion services"
+url: "https://nicoburniske.github.io"
+baseurl: "/hypertor"
+
+# Build settings
+markdown: kramdown
+highlighter: rouge
+
+# Theme - using Minimal Mistakes for modern docs
+remote_theme: mmistakes/minimal-mistakes@4.24.0
+
+# Minimal Mistakes settings
+minimal_mistakes_skin: "dark"
+search: true
+breadcrumbs: true
+atom_feed:
+  hide: true
+  path: false
+
+# Plugins (no jekyll-feed - RSS disabled)
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-remote-theme
+  - jekyll-include-cache
+
+# Feed disabled (required even though plugin is not listed)
+feed:
+  disable: true
+
+# Exclude from processing
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/
+  - README.md
+  - architecture.md
+  - python-api.md
+  - security.md
+
+# Collections for docs
+collections:
+  docs:
+    output: true
+    permalink: /:collection/:path/
+
+# Defaults
+defaults:
+  - scope:
+      path: ""
+      type: "docs"
+    values:
+      layout: "single"
+      sidebar:
+        nav: "docs"
+      toc: true
+      toc_sticky: true
+  - scope:
+      path: ""
+    values:
+      layout: "single"
+
+# Navigation
+header:
+  overlay_color: "#1a1a2e"
+
+# Footer
+footer:
+  links:
+    - label: "GitHub"
+      icon: "fab fa-fw fa-github"
+      url: "https://github.com/nicoburniske/hypertor"
+
+# Analytics (optional)
+# analytics:
+#   provider: "google-gtag"
+#   google:
+#     tracking_id: "G-XXXXXXXXXX"
+

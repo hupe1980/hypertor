@@ -1,39 +1,41 @@
 // For format details, see https://aka.ms/devcontainer.json. For config options, see the
 // README at: https://github.com/devcontainers/templates/tree/main/src/rust
 {
-	"name": "Rust",
-	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	"image": "mcr.microsoft.com/devcontainers/rust:1-1-bullseye",
+	"name": "hypertor",
+	"image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
 
-	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
-	// "mounts": [
-	// 	{
-	// 		"source": "devcontainer-cargo-cache-${devcontainerId}",
-	// 		"target": "/usr/local/cargo",
-	// 		"type": "volume"
-	// 	}
-	// ]
-
-	// Features to add to the dev container. More info: https://containers.dev/features.
-	// "features": {},
+	// Features to add to the dev container
+	"features": {
+		"ghcr.io/devcontainers/features/python:1": {
+			"version": "3.12",
+			"installTools": false
+		},
+		"ghcr.io/guiyomh/features/just:0": {},
+		"ghcr.io/devcontainers/features/ruby:1": {
+			"version": "3.2"
+		}
+	},
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
+	"forwardPorts": [9050, 4000],
 
 	// Use 'postCreateCommand' to run commands after the container is created.
-	"postCreateCommand": "rustup default stable && cargo install cargo-edit && rustup component add rustfmt",
+	"postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH=\"$HOME/.local/bin:$PATH\" && rustup component add rustfmt clippy && uv tool install maturin && gem install github-pages",
+
+	// Build Python bindings on container start
+	"postStartCommand": "export PATH=\"$HOME/.local/bin:$PATH\" && cd /workspaces/hypertor && uv venv && . .venv/bin/activate && uv pip install maturin && maturin develop 2>/dev/null || true",
+
 	// Configure tool-specific properties.
 	"customizations": {
-        "vscode": {
-            "extensions": [
-                "rust-lang.rust-analyzer", // Rust language support
-                "vadimcn.vscode-lldb",     // Debugger for Rust
-                "serayuzgur.crates",       // Crate version support
-                "editorconfig.editorconfig" // Consistent coding styles
-            ]
-        }
-    }
-
-	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
-	// "remoteUser": "root"
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"vadimcn.vscode-lldb",
+				"serayuzgur.crates",
+				"editorconfig.editorconfig",
+				"ms-python.python",
+				"tamasfe.even-better-toml"
+			]
+		}
+	}
 }

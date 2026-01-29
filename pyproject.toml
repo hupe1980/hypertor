@@ -1,0 +1,70 @@
+[project]
+name = "hypertor"
+dynamic = ["version"]
+description = "Best-in-class Tor HTTP client and server library - consume AND host .onion services"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "hupe1980" }]
+requires-python = ">=3.9"
+keywords = ["tor", "http", "privacy", "anonymity", "onion", "hidden-service", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Security",
+    "Typing :: Typed",
+    "Framework :: FastAPI",
+]
+
+[project.urls]
+Homepage = "https://hupe1980.github.io/hypertor"
+Documentation = "https://hupe1980.github.io/hypertor"
+Repository = "https://github.com/hupe1980/hypertor"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.8",
+    "ruff>=0.2",
+]
+
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module", "python"]
+python-source = "python"
+module-name = "hypertor._hypertor"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["python/tests"]
+markers = [
+    "network: marks tests as requiring Tor network (deselect with '-m \"not network\"')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

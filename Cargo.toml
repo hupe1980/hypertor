@@ -1,23 +1,180 @@
 [package]
 name = "hypertor"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 authors = ["hupe1980"]
 repository = "https://github.com/hupe1980/hypertor"
 license = "MIT"
-description = "Rust library for HTTP requests over Tor, supporting HTTP/HTTPS with configurable TLS via hyper and arti_client."
-keywords = ["tor", "http", "client", "requests"]
+description = "Tor HTTP client and onion service library with Python bindings"
+keywords = ["tor", "http", "privacy", "anonymity", "onion"]
 categories = ["network-programming", "web-programming::http-client"]
 publish = true
 
+[lib]
+name = "hypertor"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# SECURITY: rustls is the default for consistent TLS fingerprinting across platforms
+# native-tls uses different implementations per OS (OpenSSL/SecureTransport/SChannel)
+# which can leak platform information and has had compatibility issues with Tor streams
+default = ["rustls", "client"]
+
+# Core features
+client = []
+server = []
+intercept = []
+full = ["client", "server", "intercept", "rustls", "http2", "padding", "python"]
+
+# TLS backends (pick one - rustls recommended for anonymity)
+# rustls: Pure Rust, consistent fingerprint, memory-safe, recommended
+# native-tls: Uses OS TLS stack, may have platform-specific issues
+native-tls = ["dep:tokio-native-tls", "arti-client/native-tls"]
+rustls = ["dep:tokio-rustls", "dep:rustls-native-certs", "arti-client/rustls"]
+
+# HTTP versions  
+http2 = []
+
+# Privacy features
+padding = []
+
+# Python bindings
+python = ["dep:pyo3", "dep:pyo3-async-runtimes"]
+
 [dependencies]
-anyhow = "1.0.87"
+# Error handling - typed errors, NOT anyhow
+thiserror = "2.0.18"
+
+# Logging
+tracing = "0.1"
+
+# HTTP stack
+hyper = { version = "1.8", features = ["http1", "http2", "client"] }
+hyper-util = { version = "0.1.19", features = ["tokio", "client-legacy"] }
+http-body-util = "0.1"
+http-body = "1"
+http = "1.2"
 bytes = "1"
-tor-rtcompat = { version = "0", features = ["tokio", "native-tls"] }
-arti-client = {version = "0.22.0", features = ["anyhow", "tokio", "native-tls", "onion-service-client"]} 
-http-body-util = "0.1.2"
-hyper = { version = "1.4.1", features = ["http1", "client"] }
-hyper-util = { version = "0.1.7", features = ["tokio"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tokio-native-tls = "0.3.1"
-tracing-subscriber = "0.3.18"
+
+# WebSocket support - tokio-tungstenite for real WebSocket over Tor
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tungstenite = "0.28"
+
+# Tor - using arti (pure Rust implementation)
+# SECURITY: Always use latest versions for security patches
+# Features enabled:
+#   - tokio: async runtime
+#   - native-tls: TLS support
+#   - onion-service-client: connect to .onion addresses
+#   - onion-service-service: host .onion services
+#   - pt-client: pluggable transports for censorship circumvention
+#   - vanguards: path selection hardening
+#   - keymgr: secure key management (required for client auth)
+#   - restricted-discovery: client authorization for onion services
+#   - hs-pow-full: proof-of-work with Equi-X (full implementation)
+#   - geoip: geographic exit selection
+#   - bridge-client: bridge relay support
+#   - compression: directory compression
+arti-client = { version = "0.38", default-features = false, features = [
+    "tokio",
+    "native-tls",
+    "compression",
+    "onion-service-client",
+    "onion-service-service",
+    "pt-client",
+    "bridge-client",
+    "vanguards",
+    "keymgr",
+    "restricted-discovery",
+    "hs-pow-full",
+    "geoip",
+] }
+tor-rtcompat = { version = "0.38", default-features = false, features = ["tokio"] }
+tor-hsservice = { version = "0.38", default-features = false, features = ["restricted-discovery"] }
+tor-hscrypto = { version = "0.38" }
+tor-proto = { version = "0.38" }
+tor-cell = { version = "0.38" }
+tor-config = { version = "0.38" }
+tor-guardmgr = { version = "0.38" }
+tor-keymgr = { version = "0.38" }
+safelog = "0.7"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+tokio-stream = "0.1"
+pin-project-lite = "0.2"
+futures = "0.3"
+
+# Compression support
+flate2 = "1.1"
+brotli = "8"
+zstd = "0.13.3"
+
+# Encoding
+base64 = "0.22"
+urlencoding = "2.1"
+
+# TLS backends (feature-gated)
+tokio-native-tls = { version = "0.3", optional = true }
+tokio-rustls = { version = "0.26", features = ["ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+
+# Python bindings (feature-gated)
+pyo3 = { version = "0.27", features = ["extension-module"], optional = true }
+pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"], optional = true }
+
+# Utilities
+parking_lot = "0.12.5"
+rand = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+mime_guess = "2.0"
+bitflags = "2.10"
+chrono = { version = "0.4.43", features = ["serde"] }
+sha1 = "0.10"
+zeroize = { version = "1.8", features = ["derive"] }  # Secure memory cleanup for secrets
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "onion_service"
+path = "examples/onion_service.rs"
+required-features = ["server"]
+
+[[example]]
+name = "secure_api_client"
+path = "examples/secure_api_client.rs"
+
+[[example]]
+name = "multiple_identities"
+path = "examples/multiple_identities.rs"
+
+[[example]]
+name = "realtime_patterns"
+path = "examples/realtime_patterns.rs"
+
+[[example]]
+name = "socks_proxy"
+path = "examples/socks_proxy.rs"
+
+[[example]]
+name = "security_features"
+path = "examples/security_features.rs"

@@ -1,0 +1,83 @@
+# cargo-deny configuration for hypertor
+# https://embarkstudios.github.io/cargo-deny/
+
+# ============================================================================
+# Advisories - Check for known security vulnerabilities
+# ============================================================================
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+# Ignore advisories for unmaintained crates that are transitive dependencies
+# and have no security vulnerabilities (just maintenance status notices)
+ignore = [
+    "RUSTSEC-2024-0436",  # paste - unmaintained but no security issues, transitive from arti
+    # NOTE: The following is a known vulnerability in a transitive dependency.
+    # We document it here but cannot fix it as it comes from arti's dependency tree.
+    # The Marvin Attack requires network timing analysis and is mitigated by Tor's
+    # inherent network latency variability.
+    "RUSTSEC-2023-0071",  # rsa - Marvin Attack timing sidechannel, transitive from arti TLS
+]
+
+# ============================================================================
+# Licenses - Ensure all dependencies have acceptable licenses
+# ============================================================================
+[licenses]
+version = 2
+# Confidence threshold for detecting licenses
+confidence-threshold = 0.8
+
+# Allow these licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",  # Mozilla Public License (weak copyleft, OK for linking)
+    "LGPL-3.0-only",  # Required by equix (Tor PoW) - weak copyleft, dynamic linking OK
+    "BSL-1.0",  # Boost Software License - permissive
+    "OpenSSL",  # Required by aws-lc-sys (rustls crypto backend)
+]
+
+# Clarify license for crates with non-standard license files
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ============================================================================
+# Bans - Disallow certain crates
+# ============================================================================
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Deny crates we don't want in our dependency tree
+deny = [
+    # Avoid deprecated/unmaintained crates
+    { name = "failure" },
+    { name = "failure_derive" },
+    { name = "tempdir" },  # Use tempfile instead
+]
+
+# Allow specific crate duplicates if needed
+skip = []
+
+# Allow specific tree paths if needed
+skip-tree = []
+
+# ============================================================================
+# Sources - Only allow crates from trusted sources
+# ============================================================================
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

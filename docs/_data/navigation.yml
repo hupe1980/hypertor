@@ -1,0 +1,29 @@
+docs:
+  - title: "Getting Started"
+    children:
+      - title: "Installation"
+        url: /docs/installation/
+      - title: "Quickstart"
+        url: /docs/quickstart/
+
+  - title: "API Reference"
+    children:
+      - title: "TorClient"
+        url: /docs/client/
+      - title: "OnionApp"
+        url: /docs/server/
+      - title: "SOCKS5 Proxy"
+        url: /docs/proxy/
+      - title: "Security Features"
+        url: /docs/security/
+
+  - title: "Language Bindings"
+    children:
+      - title: "Python"
+        url: /docs/python/
+
+main:
+  - title: "Docs"
+    url: /docs/quickstart/
+  - title: "GitHub"
+    url: https://github.com/nicoburniske/hypertor

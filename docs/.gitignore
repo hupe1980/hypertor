@@ -1,0 +1,11 @@
+# Ignore bundler files
+/.bundle/
+/vendor/
+
+# Ignore Jekyll build output
+/_site/
+/.jekyll-cache/
+/.jekyll-metadata
+
+# Ignore Gemfile.lock for library
+Gemfile.lock

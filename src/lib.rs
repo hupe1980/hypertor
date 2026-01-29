@@ -1,219 +1,306 @@
-use anyhow::Result;
-use arti_client::{TorClient, TorClientConfig};
-use http_body_util::{Empty, Full};
-use hyper::body::Bytes;
-use hyper::body::Incoming;
-use hyper::header::HeaderValue;
-use hyper::http::uri::Scheme;
-use hyper::{Request, Response, Uri};
-use hyper_util::rt::TokioIo;
-use std::io::Error as IoError;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_native_tls::native_tls::TlsConnector;
-use tor_rtcompat::PreferredRuntime;
+//! # hypertor — Best-in-Class Tor Network Library
+//!
+//! The Tor network library for Rust — consume AND host onion services
+//! with the simplicity of `reqwest` and `axum`.
+//!
+//! ## Quick Start
+//!
+//! ### Client (like reqwest)
+//!
+//! ```rust,no_run
+//! use hypertor::prelude::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<()> {
+//!     let client = TorClient::new().await?;
+//!     let resp = client.get("http://example.onion")?.send().await?;
+//!     println!("{}", resp.text()?);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Server (like axum)
+//!
+//! ```rust,ignore
+//! use hypertor::prelude::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<()> {
+//!     let app = OnionApp::builder()
+//!         .route("/", get(|_req| async { "Hello from .onion!" }))
+//!         .build();
+//!     app.run().await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Features
+//!
+//! - **TorClient**: HTTP client over Tor with connection pooling, retries, compression
+//! - **OnionApp**: FastAPI/axum-style onion service framework
+//! - **Security**: PoW DoS protection, client auth, website fingerprinting defense
+//! - **Performance**: HTTP/2 multiplexing, circuit prewarming, request batching
+//! - **Privacy**: Stream isolation, vanguards, traffic padding
+//! - **Python**: Full sync and async bindings via PyO3
 
-/// A trait for types that implement both `AsyncRead` and `AsyncWrite`.
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![warn(missing_docs, rust_2018_idioms)]
 
-impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite {}
+// ============================================================================
+// Core Modules
+// ============================================================================
 
-/// Configuration for the `Client`.
-pub struct ClientConfig {
-    /// TLS configuration for HTTPS connections.
-    pub tls_config: TlsConnector,
-    /// Tor client configuration for routing through the Tor network.
-    pub tor_config: TorClientConfig,
-}
+pub mod body;
+pub mod client;
+pub mod config;
+pub mod error;
+pub mod prelude;
+pub mod request;
+pub mod response;
+pub mod serve;
+pub mod stream;
 
-/// Builder for creating a `ClientConfig`.
-pub struct ClientConfigBuilder {
-    tls_config: Option<TlsConnector>,
-    tor_config: Option<TorClientConfig>,
-}
+// ============================================================================
+// Networking
+// ============================================================================
 
-impl ClientConfigBuilder {
-    /// Creates a new `ClientConfigBuilder`.
-    pub fn new() -> Self {
-        ClientConfigBuilder {
-            tls_config: None,
-            tor_config: None,
-        }
-    }
+pub mod circuit;
+pub mod dns;
+pub mod doh;
+pub mod isolation;
+pub mod pool;
+pub mod proxy;
+pub mod tls;
 
-    /// Sets the TLS configuration for the `ClientConfigBuilder`.
-    pub fn tls_config(mut self, tls_config: TlsConnector) -> Self {
-        self.tls_config = Some(tls_config);
-        self
-    }
+// ============================================================================
+// Resilience
+// ============================================================================
 
-    /// Sets the Tor configuration for the `ClientConfigBuilder`.
-    pub fn tor_config(mut self, tor_config: TorClientConfig) -> Self {
-        self.tor_config = Some(tor_config);
-        self
-    }
+pub mod adaptive;
+pub mod backpressure;
+pub mod breaker;
+pub mod retry;
+pub mod rotation;
 
-    /// Builds the `ClientConfig` from the `ClientConfigBuilder`.
-    pub fn build(self) -> Result<ClientConfig> {
-        Ok(ClientConfig {
-            tls_config: self.tls_config.unwrap_or_else(|| {
-                TlsConnector::builder()
-                    .build()
-                    .expect("Failed to create default TlsConnector")
-            }),
-            tor_config: self.tor_config.unwrap_or_else(|| {
-                let mut cfg_builder = TorClientConfig::builder();
-                cfg_builder.address_filter().allow_onion_addrs(true);
-                cfg_builder
-                    .build()
-                    .expect("Failed to create default TorClientConfig")
-            }),
-        })
-    }
-}
+// ============================================================================
+// Performance
+// ============================================================================
 
-/// A client for making HTTP requests over Tor with optional TLS.
-pub struct Client {
-    tor_client: TorClient<PreferredRuntime>,
-    config: ClientConfig,
-}
+pub mod batch;
+pub mod cache;
+pub mod dedup;
+pub mod keepalive;
+pub mod prewarm;
+pub mod queue;
+pub mod ratelimit;
 
-impl Client {
-    /// Creates a new `Client` with the provided `ClientConfig`.
-    pub async fn with_config(config: ClientConfig) -> Result<Self> {
-        let tor_client = Self::create_tor_client(&config).await?;
-        Ok(Client { tor_client, config })
-    }
+// ============================================================================
+// Privacy & Security
+// ============================================================================
 
-    /// Creates a new `Client` with default configuration.
-    pub async fn new() -> Result<Self> {
-        let default_config = ClientConfigBuilder::new().build()?;
-        Self::with_config(default_config).await
-    }
+pub mod onion_service;
+pub mod security;
 
-    /// Creates a Tor client using the given configuration.
-    async fn create_tor_client(config: &ClientConfig) -> Result<TorClient<PreferredRuntime>> {
-        let tor_client = TorClient::create_bootstrapped(config.tor_config.clone()).await?;
-        Ok(tor_client)
-    }
+// ============================================================================
+// Protocol Support
+// ============================================================================
 
-    /// Sends an HTTP HEAD request to the specified URI.
-    pub async fn head<T>(&self, uri: T) -> Result<Response<Incoming>>
-    where
-        Uri: TryFrom<T>,
-        <Uri as TryFrom<T>>::Error: Into<hyper::http::Error>,
-    {
-        let req = Request::head(uri).body(Empty::<Bytes>::new())?;
+pub mod http2;
+pub mod websocket;
 
-        let resp = self.send_request(req).await?;
-        Ok(resp)
-    }
+// ============================================================================
+// Observability
+// ============================================================================
 
-    /// Sends an HTTP GET request to the specified URI.
-    pub async fn get<T>(&self, uri: T) -> Result<Response<Incoming>>
-    where
-        Uri: TryFrom<T>,
-        <Uri as TryFrom<T>>::Error: Into<hyper::http::Error>,
-    {
-        let req = Request::get(uri).body(Empty::<Bytes>::new())?;
+pub mod health;
+pub mod hooks;
+pub mod metrics;
+pub mod observability;
+pub mod prometheus;
+pub mod tracing;
 
-        let resp = self.send_request(req).await?;
-        Ok(resp)
-    }
+// ============================================================================
+// HTTP Features
+// ============================================================================
 
-    /// Sends an HTTP POST request to the specified URI with the given content type and body.
-    pub async fn post<T>(
-        &self,
-        uri: T,
-        content_type: &str,
-        body: Bytes,
-    ) -> Result<Response<Incoming>>
-    where
-        Uri: TryFrom<T>,
-        <Uri as TryFrom<T>>::Error: Into<hyper::http::Error>,
-    {
-        let req = Request::post(uri)
-            .header(hyper::header::CONTENT_TYPE, content_type)
-            .body(Full::<Bytes>::from(body))?;
+pub mod compression;
+pub mod cookies;
+pub mod middleware;
+pub mod redirect;
+pub mod session;
+pub mod streaming;
+pub mod timeout;
 
-        let resp = self.send_request(req).await?;
-        Ok(resp)
-    }
+// ============================================================================
+// Integration
+// ============================================================================
 
-    /// Sends an HTTP request and returns the response.
-    async fn send_request<B>(&self, req: Request<B>) -> Result<Response<Incoming>>
-    where
-        B: hyper::body::Body + Send + 'static, // B must implement Body and be sendable
-        B::Data: Send,                         // B::Data must be sendable
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>, // B::Error must be convertible to a boxed error
-    {
-        let stream = self.create_stream(req.uri()).await?;
+pub mod intercept;
 
-        let (mut request_sender, connection) =
-            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+// ============================================================================
+// Python Bindings
+// ============================================================================
 
-        // Spawn a task to poll the connection and drive the HTTP state
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("Error: {e:?}");
-            }
-        });
+#[cfg(feature = "python")]
+pub mod python;
 
-        let mut final_req_builder = Request::builder().uri(req.uri()).method(req.method());
+// ============================================================================
+// Re-exports — Core
+// ============================================================================
 
-        for (key, value) in req.headers() {
-            final_req_builder = final_req_builder.header(key, value);
-        }
+pub use body::Body;
+pub use client::{TorClient, TorClientBuilder};
+pub use config::{Config, ConfigBuilder};
+pub use error::{Error, Result};
+pub use request::RequestBuilder;
+pub use response::Response;
+pub use serve::{
+    AppStats, Handler, Json, MethodHandler, OnionApp, OnionAppConfig, Request as ServeRequest,
+    Response as ServeResponse, delete, get, head, options, patch, post, put,
+};
 
-        if !req.headers().contains_key(hyper::header::HOST) {
-            if let Some(authority) = req.uri().authority() {
-                let host_header_value = HeaderValue::from_str(authority.as_str()).unwrap();
-                final_req_builder =
-                    final_req_builder.header(hyper::header::HOST, host_header_value);
-            }
-        }
+// ============================================================================
+// Re-exports — Networking
+// ============================================================================
 
-        let final_req = final_req_builder.body(req.into_body())?;
+pub use circuit::{CircuitConfig, CircuitManager, CircuitStats};
+pub use dns::{DnsCache, DnsResult, TorDnsResolver};
+pub use doh::{
+    DnsRecord, DnsResponse, DohConfig, DohError, DohFormat, DohProvider, DohResolver, DohStats,
+    MultiDohResolver, RecordData, RecordType,
+};
+pub use isolation::{IsolatedSession, IsolationLevel, IsolationToken};
+pub use pool::{ConnectionPool, PoolConfig};
+pub use proxy::{ProxyConfig, ShutdownHandle, Socks5Proxy};
 
-        let resp = request_sender.send_request(final_req).await?;
+// ============================================================================
+// Re-exports — Resilience
+// ============================================================================
 
-        Ok(resp)
-    }
+pub use adaptive::{
+    AdaptiveRetry, AdaptiveRetryConfig, AdaptiveRetryManager, AdaptiveRetryStats, AttemptOutcome,
+    RetryDecision,
+};
+pub use backpressure::{
+    BackpressureConfig, BackpressureController, BackpressureError, BackpressurePermit,
+    BackpressureStats, LoadShedder,
+};
+pub use breaker::{BreakerConfig, BreakerManager, BreakerResult, BreakerState, CircuitBreaker};
+pub use retry::RetryConfig;
+pub use rotation::{CircuitHealth, CircuitRotator, RotationConfig, RotationStats};
 
-    /// Creates a stream for the specified URI, optionally wrapping it with TLS.
-    async fn create_stream(
-        &self,
-        url: &Uri,
-    ) -> Result<Box<dyn AsyncReadWrite + Unpin + Send>, IoError> {
-        let host = url
-            .host()
-            .ok_or_else(|| IoError::new(std::io::ErrorKind::InvalidInput, "Missing host"))?;
-        let https = url.scheme() == Some(&Scheme::HTTPS);
+// ============================================================================
+// Re-exports — Performance
+// ============================================================================
 
-        let port = match url.port_u16() {
-            Some(port) => port,
-            None if https => 443,
-            None => 80,
-        };
+pub use batch::{Batch, BatchConfig, BatchItem, BatchProcessor, Batcher, BatcherStats};
+pub use cache::{CacheConfig, CacheControl, CachedResponse, HttpCache};
+pub use dedup::{DedupConfig, Deduplicator, RequestKey, SharedResult};
+pub use keepalive::{ConnectionState, KeepAliveConfig, KeepAliveHints};
+pub use prewarm::{CircuitPrewarmer, PrewarmConfig};
+pub use queue::{Priority, PriorityQueue, QueueConfig, QueueStatistics};
+pub use ratelimit::{RateLimitConfig, RateLimitResult, RateLimiter, TokenBucket};
 
-        // Establish the initial stream connection
-        let stream = self
-            .tor_client
-            .connect((host, port))
-            .await
-            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+// ============================================================================
+// Re-exports — Privacy & Security
+// ============================================================================
 
-        if https {
-            // Wrap the stream with TLS
-            let tls_connector = &self.config.tls_config;
-            let cx = tokio_native_tls::TlsConnector::from(tls_connector.clone());
-            let wrapped_stream = cx
-                .connect(host, stream)
-                .await
-                .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
-            Ok(Box::new(wrapped_stream) as Box<dyn AsyncReadWrite + Unpin + Send>)
-        } else {
-            // Return the unwrapped stream directly for HTTP
-            Ok(Box::new(stream) as Box<dyn AsyncReadWrite + Unpin + Send>)
-        }
-    }
-}
+pub use security::{
+    ClientSecurityConfig,
+    // Security Presets (wire to real arti APIs)
+    SecurityLevel,
+    ServiceSecurityConfig,
+};
+// Re-export VanguardMode from arti for user convenience
+// This is the REAL vanguard API - wired to TorClientConfigBuilder::vanguards().mode()
+pub use tor_guardmgr::VanguardMode;
+// onion_service provides real arti-based onion service hosting
+pub use onion_service::{
+    ClientAuthKey as HsClientKey,
+    ClientAuthMode,
+    // Client authorization key for restricted discovery
+    HsClientDescEncKey,
+    OnionService as HiddenService,
+    OnionServiceConfig as HsConfig,
+    OnionServiceWithEvents as HiddenServiceWithEvents,
+    OnionStream as HsStream,
+    RateLimit,
+    ServiceEvent as HsEvent,
+    ServiceState as HsState,
+    ServiceStats as HsStats,
+};
+
+// ============================================================================
+// Re-exports — Protocol Support
+// ============================================================================
+
+pub use http2::{
+    ConnectionState as Http2ConnectionState, ErrorCode as Http2ErrorCode, Frame as Http2Frame,
+    FrameFlags, FrameHeader, FrameType, Hpack, Http2Config, Http2Connection, Http2Error,
+    Http2Stats, SettingId, Settings as Http2Settings, Stream as Http2Stream, StreamEvent,
+    StreamState as Http2StreamState,
+};
+
+pub use websocket::{
+    CloseCode,
+    CloseFrame,
+    EchoHandler,
+    Frame,
+    Message as WsMessage,
+    Opcode,
+    // REAL WebSocket over Tor
+    TorWebSocket,
+    TorWebSocketBuilder,
+    UpgradeRequest,
+    UpgradeResponse,
+    WebSocketClient,
+    WebSocketConfig,
+    WebSocketConnection,
+    WebSocketError,
+    WebSocketHandler,
+    WebSocketServer,
+    WebSocketState,
+    WebSocketStats,
+    generate_accept_key,
+    generate_client_key,
+};
+
+// ============================================================================
+// Re-exports — Observability
+// ============================================================================
+
+pub use health::{HealthCheck, HealthCheckConfig, HealthStatus, Metrics};
+pub use hooks::{ErrorHook, Hooks, PostResponseHook, PreRequestHook};
+pub use metrics::{Counter, Gauge, Histogram, HttpMetrics, MetricsReport};
+pub use prometheus::{
+    HistogramTimer, MetricsRegistry, PrometheusCounter, PrometheusGauge, PrometheusHistogram,
+    PrometheusSummary, TorMetrics, default_latency_buckets, export_metrics, global_metrics, labels,
+    size_buckets, tor_latency_buckets,
+};
+pub use tracing::{Span, SpanId, SpanKind, SpanStatus, TraceContext, TraceId, Tracer};
+
+// ============================================================================
+// Re-exports — HTTP Features
+// ============================================================================
+
+pub use compression::Compression;
+pub use cookies::{Cookie, CookieJar};
+pub use middleware::{HeaderMiddleware, LoggingMiddleware, MiddlewareStack, RateLimitMiddleware};
+pub use redirect::{RedirectAction, RedirectGuard, RedirectPolicy};
+pub use session::Session;
+pub use streaming::{StreamingBody, StreamingResponseBuilder};
+pub use timeout::Timeouts;
+
+// ============================================================================
+// Re-exports — Integration
+// ============================================================================
+
+pub use intercept::{
+    FnRequestInterceptor, FnResponseInterceptor, HttpExchange, HttpHistory, InterceptConfig,
+    InterceptId, InterceptProxy, InterceptedRequest, InterceptedResponse, ModifiedRequest,
+    ModifiedResponse, RequestAction, RequestInterceptor, ResponseAction, ResponseInterceptor,
+};
+
+/// Library version
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
