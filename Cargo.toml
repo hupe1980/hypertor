@@ -30,8 +30,8 @@ full = ["client", "server", "intercept", "rustls", "http2", "padding", "python"]
 # TLS backends (pick one - rustls recommended for anonymity)
 # rustls: Pure Rust, consistent fingerprint, memory-safe, recommended
 # native-tls: Uses OS TLS stack, may have platform-specific issues
-native-tls = ["dep:tokio-native-tls", "arti-client/native-tls", "tor-rtcompat/native-tls"]
-rustls = ["dep:tokio-rustls", "dep:rustls-native-certs", "arti-client/rustls", "tor-rtcompat/rustls"]
+native-tls = ["dep:tokio-native-tls", "arti-client/native-tls", "tor-rtcompat/native-tls", "tokio-tungstenite/native-tls"]
+rustls = ["dep:tokio-rustls", "dep:rustls-native-certs", "arti-client/rustls", "tor-rtcompat/rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
 
 # HTTP versions  
 http2 = []
@@ -61,7 +61,8 @@ http = "1.2"
 bytes = "1"
 
 # WebSocket support - tokio-tungstenite for real WebSocket over Tor
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+# TLS backend is feature-gated to match the library's TLS configuration
+tokio-tungstenite = { version = "0.28", default-features = false }
 tungstenite = "0.28"
 
 # Tor - using arti (pure Rust implementation)

@@ -45,9 +45,17 @@ jobs:
         run: sudo apt-get install -y musl-tools
       
       # Use rustls features (no OpenSSL needed) for cross-platform builds
-      # Windows needs static-sqlite since SQLite isn't available as a system library
-      - name: Build (non-Windows)
-        if: matrix.target != 'x86_64-pc-windows-msvc'
+      # musl and Windows need static-sqlite since SQLite isn't available as a system library
+      - name: Build (Linux glibc)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls"
+      
+      - name: Build (Linux musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls,static-sqlite"
+      
+      - name: Build (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
         run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls"
       
       - name: Build (Windows)
@@ -109,23 +117,23 @@ jobs:
         with:
           version: 0.11.0
       
-      # Use rustls (python feature implies rustls default) - no OpenSSL needed
-      # Windows needs static-sqlite since SQLite isn't available as a system library
+      # All builds use rustls for pure-Rust TLS (no OpenSSL cross-compilation issues)
+      # Cross-compiled and Windows builds need static-sqlite since SQLite isn't available
       - name: Build wheels (Linux x86_64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: maturin build --release --features python --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} -i python3.11
+        run: maturin build --release --features "python,rustls" --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} -i python3.11
       
       - name: Build wheels (Linux ARM64 cross-compile)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: maturin build --release --features python --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} --zig -i python3.11
+        run: maturin build --release --features "python,rustls,static-sqlite" --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} --zig -i python3.11
       
       - name: Build wheels (macOS)
         if: endsWith(matrix.target, 'apple-darwin')
-        run: maturin build --release --features python --target ${{ matrix.target }}
+        run: maturin build --release --features "python,rustls" --target ${{ matrix.target }}
       
       - name: Build wheels (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: maturin build --release --features "python,static-sqlite" --target ${{ matrix.target }}
+        run: maturin build --release --features "python,rustls,static-sqlite" --target ${{ matrix.target }}
       
       - name: Upload wheels
         uses: actions/upload-artifact@v4
