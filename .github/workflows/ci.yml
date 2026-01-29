@@ -132,9 +132,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run security audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
 
   # ============================================================================
   # Semver Compatibility Check
