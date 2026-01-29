@@ -7,6 +7,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Security: Reproducible builds
+  CARGO_INCREMENTAL: 0
+
+# Ensure only one release runs at a time
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   # ============================================================================
@@ -39,8 +46,9 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools
       
+      # Use rustls features (no OpenSSL needed) for cross-platform builds
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --all-features
+        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -88,9 +96,9 @@ jobs:
       - name: Install maturin
         run: pip install maturin
       
+      # Use rustls (python feature implies rustls default) - no OpenSSL needed
       - name: Build wheels
-        run: |
-          maturin build --release --features python --target ${{ matrix.target }} --manylinux ${{ matrix.manylinux }}
+        run: maturin build --release --features python --target ${{ matrix.target }} --manylinux ${{ matrix.manylinux }}
       
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -129,8 +137,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Note: Default features (rustls) are used for publishing
+      # Users can enable native-tls if they need it
       - name: Publish
-        run: cargo publish --all-features
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

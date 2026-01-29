@@ -6,12 +6,19 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Run daily at 00:00 UTC to catch regressions
+    # Run daily at 00:00 UTC to catch regressions and security issues
     - cron: '0 0 * * *'
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Security: Minimize information leakage in CI logs
+  CARGO_INCREMENTAL: 0
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ============================================================================
@@ -36,12 +43,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Strict warnings for library code
+      # Strict warnings for library code (exclude python feature - tested separately)
       - name: Clippy (library)
-        run: cargo clippy --lib --all-features -- -D warnings
+        run: cargo clippy --lib --features "client,server,http2,padding,rustls" -- -D warnings
       # Allow unwrap() in tests/examples/benches
       - name: Clippy (tests & examples)
-        run: cargo clippy --tests --examples --benches --all-features -- -W clippy::unwrap_used
+        run: cargo clippy --tests --examples --benches --features "client,server,http2,padding,rustls" -- -W clippy::unwrap_used
 
   # ============================================================================
   # Unit Tests (all platforms)
@@ -64,16 +71,14 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       
-      # Install OpenSSL on Windows
-      - name: Install OpenSSL (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install openssl
-          echo "OPENSSL_DIR=C:\Program Files\OpenSSL-Win64" >> $GITHUB_ENV
-        shell: bash
+      # Run tests with rustls (default) - works on all platforms without system deps
+      - name: Run tests (rustls)
+        run: cargo test --features "client,server,http2,padding,rustls" --workspace
       
-      - name: Run tests
-        run: cargo test --all-features --workspace
+      # On Linux/macOS, also test native-tls (requires OpenSSL)
+      - name: Run tests (native-tls)
+        if: matrix.os != 'windows-latest'
+        run: cargo test --no-default-features --features "client,server,http2,padding,native-tls" --workspace
       
       - name: Run tests (no default features)
         run: cargo test --no-default-features
@@ -115,7 +120,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Build docs
-        run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps
+        run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --features "client,server,http2,padding,rustls" --no-deps
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
 
@@ -170,7 +175,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --features "client,server,http2,padding,rustls" --workspace --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
@@ -181,13 +186,13 @@ jobs:
   # MSRV Check
   # ============================================================================
   msrv:
-    name: Minimum Supported Rust Version (1.85)
+    name: Minimum Supported Rust Version (1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-features
+      - run: cargo check --features "client,server,http2,padding,rustls"
 
   # ============================================================================
   # Python Bindings
@@ -241,8 +246,16 @@ jobs:
         run: cargo test --test security -- --nocapture
       - name: Verify no unsafe code
         run: |
-          if grep -r "unsafe" src/*.rs | grep -v "forbid(unsafe_code)" | grep -v "// SAFETY:" | grep -v "#\[" | head -5; then
-            echo "Found unexpected unsafe code!"
+          # Search for 'unsafe' keyword in Rust files, excluding legitimate uses
+          # Uses find + grep instead of grep -r for consistent behavior across platforms
+          UNSAFE_FOUND=$(find src -name "*.rs" -exec grep -l "unsafe" {} \; | xargs grep -n "unsafe" 2>/dev/null | \
+            grep -v "forbid(unsafe_code)" | \
+            grep -v "// SAFETY:" | \
+            grep -v "#!\[" | \
+            grep -v "#\[" || true)
+          if [ -n "$UNSAFE_FOUND" ]; then
+            echo "Found unexpected unsafe code:"
+            echo "$UNSAFE_FOUND"
             exit 1
           fi
           echo "✓ No unexpected unsafe code found"
@@ -259,7 +272,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run benchmarks
-        run: cargo bench --all-features -- --noplot
+        run: cargo bench --features "client,server,http2,padding,rustls" --bench benchmarks -- --noplot
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1
         with:
@@ -279,6 +292,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check package
-        run: cargo package --all-features --allow-dirty
+        run: cargo package --allow-dirty
       - name: Check publish (dry-run)
-        run: cargo publish --dry-run --all-features --allow-dirty
+        run: cargo publish --dry-run --allow-dirty

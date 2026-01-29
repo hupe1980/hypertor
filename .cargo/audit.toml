@@ -1,0 +1,13 @@
+# cargo-audit configuration
+# https://rustsec.org/
+
+[advisories]
+# Advisories to ignore (transitive dependencies from arti-client we cannot fix)
+ignore = [
+    # RUSTSEC-2023-0071: rsa crate - Marvin Attack timing side-channel
+    # This is a transitive dependency from arti-client (tor-llcrypto -> rsa)
+    # No fix available upstream yet. The Tor Project is aware and tracking this.
+    # Risk: Medium severity (5.9), but requires significant resources to exploit
+    # and arti uses RSA only for legacy Tor protocol compatibility.
+    "RUSTSEC-2023-0071",
+]
