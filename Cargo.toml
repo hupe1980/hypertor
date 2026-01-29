@@ -2,7 +2,7 @@
 name = "hypertor"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 authors = ["hupe1980"]
 repository = "https://github.com/hupe1980/hypertor"
 license = "MIT"

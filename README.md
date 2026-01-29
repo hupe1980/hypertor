@@ -6,7 +6,7 @@
 [![Crates.io](https://img.shields.io/crates/v/hypertor.svg)](https://crates.io/crates/hypertor)
 [![Documentation](https://docs.rs/hypertor/badge.svg)](https://docs.rs/hypertor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://www.rust-lang.org)
+[![MSRV](https://img.shields.io/badge/MSRV-1.86-blue.svg)](https://www.rust-lang.org)
 
 ---
 

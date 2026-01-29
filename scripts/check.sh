@@ -94,7 +94,7 @@ check_toolchain() {
     cargo --version
     
     # Check MSRV compatibility
-    local msrv="1.85"
+    local msrv="1.86"
     local current_version
     current_version=$(rustc --version | grep -oE '[0-9]+\.[0-9]+' | head -1)
     
