@@ -6,6 +6,8 @@ header:
   overlay_color: "#16213e"
   overlay_filter: "0.7"
 classes: wide
+sidebar: false
+author_profile: false
 ---
 
 <style>
