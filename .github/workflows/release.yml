@@ -7,67 +7,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Security: Reproducible builds
   CARGO_INCREMENTAL: 0
 
-# Ensure only one release runs at a time
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  # ============================================================================
-  # Build release binaries
-  # ============================================================================
-  build:
-    name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y musl-tools
-      
-      # Use rustls features (no OpenSSL needed) for cross-platform builds
-      # musl and Windows need static-sqlite since SQLite isn't available as a system library
-      - name: Build (Linux glibc)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls"
-      
-      - name: Build (Linux musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls,static-sqlite"
-      
-      - name: Build (macOS)
-        if: matrix.target == 'aarch64-apple-darwin'
-        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls"
-      
-      - name: Build (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo build --release --target ${{ matrix.target }} --features "client,server,http2,padding,rustls,static-sqlite"
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: hypertor-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/libhypertor*
-
   # ============================================================================
   # Build Python wheels (manylinux, macOS, Windows)
   # ============================================================================
@@ -78,22 +24,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 - native build
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             compatibility: manylinux2014
-            use_zig: false
-          # Linux ARM64 - cross-compile with zig
+            use_zig: true
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             compatibility: manylinux2014
             use_zig: true
-          # macOS (Apple Silicon only)
           - os: macos-latest
             target: aarch64-apple-darwin
             compatibility: ''
             use_zig: false
-          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             compatibility: ''
@@ -110,26 +52,23 @@ jobs:
       - name: Install maturin
         run: pip install maturin
       
-      # Install zig for cross-compilation (ARM64 Linux from x86_64)
       - name: Install zig
         if: matrix.use_zig
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.11.0
       
-      # All builds use rustls for pure-Rust TLS (no OpenSSL cross-compilation issues)
-      # Cross-compiled and Windows builds need static-sqlite since SQLite isn't available
       - name: Build wheels (Linux x86_64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: maturin build --release --features "python,rustls" --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} -i python3.11
+        run: maturin build --release --features "python,rustls,static-sqlite" --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} --zig -i python3.11
       
-      - name: Build wheels (Linux ARM64 cross-compile)
+      - name: Build wheels (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: maturin build --release --features "python,rustls,static-sqlite" --target ${{ matrix.target }} --compatibility ${{ matrix.compatibility }} --zig -i python3.11
       
       - name: Build wheels (macOS)
         if: endsWith(matrix.target, 'apple-darwin')
-        run: maturin build --release --features "python,rustls" --target ${{ matrix.target }}
+        run: maturin build --release --features "python,rustls,static-sqlite" --target ${{ matrix.target }}
       
       - name: Build wheels (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -167,13 +106,10 @@ jobs:
   # ============================================================================
   publish-crates:
     name: Publish to crates.io
-    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Note: Default features (rustls) are used for publishing
-      # Users can enable native-tls if they need it
       - name: Publish
         run: cargo publish
         env:
@@ -186,10 +122,8 @@ jobs:
     name: Publish to PyPI
     needs: [python-wheels, sdist]
     runs-on: ubuntu-latest
-    # Specifying a GitHub environment is optional, but strongly encouraged
     environment: pypi
     permissions:
-      # IMPORTANT: this permission is mandatory for Trusted Publishing
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
@@ -205,26 +139,3 @@ jobs:
       
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-
-  # ============================================================================
-  # Create GitHub Release
-  # ============================================================================
-  release:
-    name: Create Release
-    needs: [build, python-wheels, sdist]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
-      
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-          generate_release_notes: true
-          draft: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
