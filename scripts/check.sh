@@ -105,6 +105,32 @@ check_toolchain() {
     fi
 }
 
+check_tls_backend_required() {
+    print_header "TLS Backend Validation"
+    
+    print_step "Verifying compile-time TLS requirement"
+    
+    # The library should fail to compile without a TLS backend
+    # This validates our compile_error! guard works correctly
+    local output
+    output=$(cargo check --no-default-features 2>&1)
+    
+    # Check for our custom error message (may be split across lines)
+    if echo "$output" | grep -q "requires a TLS backend"; then
+        print_success "TLS backend requirement enforced correctly"
+    else
+        # Check if it actually compiled (which would be wrong)
+        if echo "$output" | grep -q "Finished"; then
+            print_failure "Library compiled without TLS backend (should fail)"
+            return 1
+        else
+            print_failure "TLS backend check failed with unexpected error"
+            echo "$output" | head -15
+            return 1
+        fi
+    fi
+}
+
 check_format() {
     print_header "Code Formatting"
     echo "Running: cargo fmt --all -- --check"
@@ -319,6 +345,7 @@ main() {
     
     # Always run these
     check_toolchain
+    check_tls_backend_required
     check_format
     check_clippy_lib
     check_unit_tests

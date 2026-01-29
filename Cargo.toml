@@ -30,8 +30,8 @@ full = ["client", "server", "intercept", "rustls", "http2", "padding", "python"]
 # TLS backends (pick one - rustls recommended for anonymity)
 # rustls: Pure Rust, consistent fingerprint, memory-safe, recommended
 # native-tls: Uses OS TLS stack, may have platform-specific issues
-native-tls = ["dep:tokio-native-tls", "arti-client/native-tls"]
-rustls = ["dep:tokio-rustls", "dep:rustls-native-certs", "arti-client/rustls"]
+native-tls = ["dep:tokio-native-tls", "arti-client/native-tls", "tor-rtcompat/native-tls"]
+rustls = ["dep:tokio-rustls", "dep:rustls-native-certs", "arti-client/rustls", "tor-rtcompat/rustls"]
 
 # HTTP versions  
 http2 = []

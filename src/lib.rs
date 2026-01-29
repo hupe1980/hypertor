@@ -47,6 +47,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![warn(missing_docs, rust_2018_idioms)]
 
+// Require at least one TLS backend - Tor cannot function without TLS
+#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+compile_error!(
+    "hypertor requires a TLS backend. Enable either 'rustls' (recommended) or 'native-tls' feature."
+);
+
 // ============================================================================
 // Core Modules
 // ============================================================================

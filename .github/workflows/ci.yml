@@ -85,10 +85,6 @@ jobs:
       - name: Run tests (native-tls)
         if: matrix.os != 'windows-latest'
         run: cargo test --no-default-features --features "client,server,http2,padding,native-tls" --workspace
-      
-      - name: Run tests (no default features)
-        if: matrix.os != 'windows-latest'
-        run: cargo test --no-default-features
 
   # ============================================================================
   # Feature Matrix Tests
@@ -99,15 +95,19 @@ jobs:
     strategy:
       matrix:
         features:
+          # Default features (includes rustls + client)
           - ""
+          # Core features with default TLS (rustls)
           - "client"
           - "server"
-          - "native-tls"
-          - "rustls"
           - "http2"
           - "padding"
-          - "python"
-          - "client,server,http2"
+          # TLS backends (each enables a valid TLS stack)
+          - "rustls"
+          - "native-tls"
+          # Combinations with explicit TLS
+          - "client,server,http2,rustls"
+          - "client,server,http2,native-tls"
           - "full"
     steps:
       - uses: actions/checkout@v4
