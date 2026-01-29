@@ -1,4 +1,4 @@
-# hypertor 🧅
+# 🧅 hypertor
 
 **The Tor network library for Rust and Python** — consume AND host onion services with the simplicity of `reqwest` and `axum`.
 

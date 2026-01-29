@@ -257,7 +257,7 @@ Traditional Tor libraries force you to choose: either a complex low-level API fo
 
 ## Quick Examples
 
-<div class="code-section">
+<div class="code-section" markdown="1">
 <h4>Rust — Anonymous Client</h4>
 
 ```rust
@@ -278,7 +278,7 @@ async fn main() -> Result<()> {
 ```
 </div>
 
-<div class="code-section">
+<div class="code-section" markdown="1">
 <h4>Rust — Onion Service</h4>
 
 ```rust
@@ -299,7 +299,7 @@ async fn main() -> hypertor::Result<()> {
 ```
 </div>
 
-<div class="code-section">
+<div class="code-section" markdown="1">
 <h4>Python — httpx-style Client</h4>
 
 ```python
@@ -315,7 +315,7 @@ asyncio.run(main())
 ```
 </div>
 
-<div class="code-section">
+<div class="code-section" markdown="1">
 <h4>Python — FastAPI-style Server</h4>
 
 ```python
