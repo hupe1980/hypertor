@@ -79,9 +79,9 @@ tungstenite = "0.28"
 #   - geoip: geographic exit selection
 #   - bridge-client: bridge relay support
 #   - compression: directory compression
+# NOTE: TLS backend (native-tls/rustls) is controlled via hypertor features, not here
 arti-client = { version = "0.38", default-features = false, features = [
     "tokio",
-    "native-tls",
     "compression",
     "onion-service-client",
     "onion-service-service",
