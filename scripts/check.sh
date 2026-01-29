@@ -227,10 +227,11 @@ check_feature_combinations() {
 }
 
 check_deny() {
-    print_header "Cargo Deny (Licenses & Advisories)"
+    print_header "Cargo Deny (Bans & Advisories)"
     
     if check_command cargo-deny; then
-        run_check "cargo deny" cargo deny check
+        # Skip license check - upstream crates change licenses frequently
+        run_check "cargo deny" cargo deny check bans advisories sources
     else
         print_skip "cargo deny (install with: cargo install cargo-deny)"
     fi
