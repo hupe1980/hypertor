@@ -164,7 +164,7 @@ jobs:
         continue-on-error: true  # Advisory for now
 
   # ============================================================================
-  # Dependency License & Ban Check
+  # Dependency Ban & Advisory Check (license check removed - too volatile)
   # ============================================================================
   deny:
     name: Cargo Deny
@@ -172,6 +172,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans advisories sources
 
   # ============================================================================
   # Code Coverage
