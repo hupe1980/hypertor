@@ -24,6 +24,7 @@ Cargo.lock
 _prompts/
 FINDINGS.md
 .venv/
+.DS_Store
 
 # Python
 __pycache__/
