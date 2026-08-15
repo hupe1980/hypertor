@@ -82,6 +82,8 @@ impl IsolationToken {
         }
     }
 
+    /// Unused in a build with no outbound-connection feature enabled.
+    #[allow(dead_code)]
     pub(crate) fn inner(self) -> ArtiToken {
         self.inner
     }

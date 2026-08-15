@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block body %}
+<main id="main">
+
+<section class="hero">
+  <div class="hero-inner">
+    <p class="eyebrow">Rust · Python</p>
+    <h1>{{ section.extra.headline }}</h1>
+    <p class="lede">{{ section.extra.tagline | safe }}</p>
+    <div class="cta">
+      <a class="btn btn--primary" href="{{ get_url(path='@/docs/quickstart.md') }}">Get started</a>
+      <a class="btn" href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+      <a class="btn" href="{{ config.extra.api_docs }}" rel="noopener">API reference</a>
+    </div>
+    <p class="hero-note">{{ section.extra.note | safe }}</p>
+  </div>
+</section>
+
+{#- Everything below is authored in content/_index.md, so the code samples get
+    the same syntax highlighting as the rest of the documentation and can be
+    edited without touching a template. -#}
+<div class="landing">
+  {{ section.content | safe }}
+</div>
+
+</main>
+{% endblock body %}

@@ -1,0 +1,50 @@
+base_url = "https://hupe1980.github.io/hypertor"
+title = "hypertor"
+description = "Tor for Rust and Python. Make HTTP requests over the Tor network and host onion services, with no Tor daemon required."
+default_language = "en"
+compile_sass = true
+minify_html = true
+
+# Zola writes both from the pages it builds, so they never drift from the site.
+generate_sitemap = true
+generate_robots_txt = true
+
+build_search_index = true
+
+taxonomies = []
+
+[markdown]
+# Anchors on every heading: documentation gets linked to by section far more
+# than by page.
+insert_anchor_links = "heading"
+smart_punctuation = true
+
+[markdown.highlighting]
+# Two themes, selected by the reader's colour scheme, rather than one that is
+# unreadable in half of them.
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+[search]
+# JSON rather than the elasticlunr JavaScript bundle: the site ships a small
+# search of its own instead of a library, so the index is all that is needed.
+index_format = "elasticlunr_json"
+include_title = true
+include_description = true
+include_path = true
+include_content = true
+
+[link_checker]
+# gitlab.torproject.org answers automated requests with 403, so the checker
+# reports the Tor Project's own repository as broken. Skipping the host keeps
+# `zola check` meaningful for the links it *can* verify instead of training
+# everyone to ignore its output.
+skip_prefixes = ["https://gitlab.torproject.org/"]
+
+[extra]
+repo = "https://github.com/hupe1980/hypertor"
+crate = "https://crates.io/crates/hypertor"
+api_docs = "https://docs.rs/hypertor"
+pypi = "https://pypi.org/project/hypertor/"
+edit_path = "https://github.com/hupe1980/hypertor/edit/main/site/content/"
+og_image = "og.png"

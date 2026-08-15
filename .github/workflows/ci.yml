@@ -106,6 +106,24 @@ jobs:
         run: cargo check --no-default-features --features "server,rustls"
       - name: native-tls without rustls
         run: cargo check --no-default-features --features "client,native-tls"
+      - name: No features at all
+        run: cargo check --no-default-features
+
+      # A TLS backend is mandatory — Tor's link protocol is itself TLS — and
+      # Cargo features cannot express "requires one of". Without the
+      # `compile_error!` in src/lib.rs this fails a crate away with `unresolved
+      # import tor_rtcompat::PreferredRuntime`, which names neither the cause
+      # nor the fix. Assert the diagnostic, not just the failure.
+      - name: A missing TLS backend is diagnosed, not left to a stray import
+        run: |
+          for features in client server socks ws; do
+            out=$(cargo check --no-default-features --features "$features" 2>&1) && {
+              echo "::error::--features $features built without a TLS backend"; exit 1; }
+            grep -q 'hypertor needs a TLS backend' <<<"$out" || {
+              echo "::error::--features $features failed without the explanatory error:"
+              echo "$out" | grep -E '^error' | head -5; exit 1; }
+            echo "ok: $features"
+          done
 
   # ---------------------------------------------------------------------------
   # Documentation
@@ -125,12 +143,14 @@ jobs:
   # ---------------------------------------------------------------------------
   # MSRV
   # ---------------------------------------------------------------------------
+  # arti 0.45 requires 1.91; a lower floor here would only fail deep inside a
+  # dependency with an error that names the wrong crate.
   msrv:
-    name: MSRV (1.86)
+    name: MSRV (1.91)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.86
+      - uses: dtolnay/rust-toolchain@1.91
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --features full
 
@@ -205,19 +225,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: pip install maturin pytest pytest-asyncio mypy ruff
-      - run: maturin build --features python --release
-      - run: pip install --find-links target/wheels hypertor
 
+      # Everything for the bindings lives in one directory, pyproject.toml
+      # included, so maturin needs no path overrides.
+      - name: Build the wheel
+        working-directory: bindings/python
+        run: maturin build --release
+
+      - name: Install it
+        working-directory: bindings/python
+        run: pip install --find-links ../../target/wheels hypertor
+
+      # Offline by default; the `network` marker is deselected in pyproject.toml.
       - name: Test
-        run: pytest python/tests -v
+        working-directory: bindings/python
+        run: pytest -v
 
       - name: Lint
+        working-directory: bindings/python
         run: |
-          ruff check python/ python_examples/
-          ruff format --check python/ python_examples/
+          ruff check hypertor/ tests/ examples/
+          ruff format --check hypertor/ tests/ examples/
 
       - name: Type-check the stubs
-        run: mypy python/hypertor
+        working-directory: bindings/python
+        run: mypy hypertor
+
+      # The bindings are a separate crate, so the main clippy and test jobs do
+      # not see them. Run both here, where a Python interpreter is available to
+      # link against — the crate does not enable `pyo3/extension-module`, so a
+      # test binary links libpython and the unit tests actually run.
+      - name: Clippy (bindings)
+        run: cargo clippy -p hypertor-python --all-targets -- -D warnings
+
+      # These cover the handler-return-value contract that the whole Python
+      # `OnionApp` rests on — what a str, dict, tuple or None becomes. Nothing
+      # else executes them.
+      - name: Test (bindings)
+        run: cargo test -p hypertor-python
 
   # ---------------------------------------------------------------------------
   # Release readiness
@@ -231,7 +276,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-semver-checks
       - run: cargo semver-checks check-release --default-features
-        # 0.3.0 is a deliberate breaking release; advisory until 1.0.
+        # 0.4.0 is a deliberate breaking release; advisory until 1.0.
         continue-on-error: true
 
   package:
@@ -242,3 +287,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo publish --dry-run
+
+      # The published crate must never carry the Python bindings: they would
+      # drag pyo3 into every Rust consumer's dependency graph for a feature none
+      # of them can use.
+      - name: The published tarball contains no bindings
+        run: |
+          if cargo package --list | grep -qE '^(bindings|python)/'; then
+            echo "the Python bindings leaked into the published package"; exit 1
+          fi
+          if cargo tree --all-features -e normal | grep -qi pyo3; then
+            echo "pyo3 reachable from the published crate"; exit 1
+          fi
+          echo ok

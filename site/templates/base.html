@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="{{ config.default_language }}" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Zola exposes `page` or `section` depending on the template, and neither in
+    the 404. Resolving the pair here rather than per-tag is what keeps every
+    page from silently inheriting the site-wide title and description, which is
+    both useless to a reader scanning search results and a duplicate-content
+    signal to the engine producing them. -#}
+{%- block seo -%}
+{%- set_global doc_title = config.title -%}
+{%- set_global doc_desc = config.description -%}
+{%- set_global is_article = false -%}
+
+{%- if page is defined -%}
+  {%- set_global doc_title = page.title -%}
+  {%- set_global is_article = true -%}
+  {%- if page.description -%}{%- set_global doc_desc = page.description -%}{%- endif -%}
+{%- elif section is defined and section.title -%}
+  {%- set_global doc_title = section.title -%}
+  {%- if section.description -%}{%- set_global doc_desc = section.description -%}{%- endif -%}
+{%- endif -%}
+{%- endblock seo -%}
+
+{%- set canonical = current_url | default(value=config.base_url) -%}
+
+<title>{% if doc_title == config.title %}hypertor — Tor for Rust and Python{% else %}{{ doc_title }} · hypertor{% endif %}</title>
+<meta name="description" content="{{ doc_desc }}">
+<link rel="canonical" href="{{ canonical | safe }}">
+
+<meta property="og:type" content="{% if is_article %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ doc_title }}">
+<meta property="og:description" content="{{ doc_desc }}">
+<meta property="og:url" content="{{ canonical | safe }}">
+<meta property="og:image" content="{{ get_url(path=config.extra.og_image) }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="hypertor — Tor for Rust and Python">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ doc_title }}">
+<meta name="twitter:description" content="{{ doc_desc }}">
+<meta name="twitter:image" content="{{ get_url(path=config.extra.og_image) }}">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+<link rel="alternate icon" href="{{ get_url(path='favicon.png') }}">
+<link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+
+{#- Structured data. `SoftwareSourceCode` is what this actually is; search
+    engines use it for the rich result, and lying about the type is how you get
+    ignored rather than featured. -#}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "hypertor",
+  "description": "{{ config.description }}",
+  "url": "{{ config.base_url | safe }}",
+  "codeRepository": "{{ config.extra.repo }}",
+  "programmingLanguage": ["Rust", "Python"],
+  "license": "https://opensource.org/licenses/MIT",
+  "keywords": "Tor, onion service, HTTP client, privacy, anonymity, Rust, Python, arti, SOCKS5"
+}
+</script>
+
+{#- Applied before first paint, so a reader who chose light does not get a dark
+    flash on every navigation. -#}
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('theme');
+      if (t) document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  })();
+</script>
+</head>
+
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <a class="brand" href="{{ get_url(path='@/_index.md') }}">
+    <span class="brand-mark" aria-hidden="true">🧅</span>
+    <span class="brand-name">hypertor</span>
+  </a>
+
+  <nav class="topnav" aria-label="Main">
+    <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+    <a href="{{ config.extra.api_docs }}" rel="noopener">API</a>
+    <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+  </nav>
+
+  <div class="topbar-tools">
+    <button id="search-open" class="icon-btn" aria-label="Search documentation" title="Search">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    </button>
+    <button id="theme-toggle" class="icon-btn" aria-label="Switch colour scheme" title="Colour scheme">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+    </button>
+  </div>
+</header>
+
+{% block body %}{% endblock body %}
+
+<footer class="sitefoot">
+  <div class="sitefoot-inner">
+    <p>
+      <strong>hypertor</strong> is MIT licensed. It is not affiliated with, endorsed by, or
+      sponsored by the Tor Project.
+    </p>
+    <p class="muted">
+      Tor protects the network path. It cannot protect you from an application that logs in with
+      your real identity, from timing patterns in your own traffic, or from a compromised machine.
+      Read the <a href="https://support.torproject.org/" rel="noopener">Tor Project's guidance</a>
+      before relying on this for anything that matters.
+    </p>
+    <nav class="footlinks" aria-label="Footer">
+      <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+      <a href="{{ config.extra.crate }}" rel="noopener">crates.io</a>
+      <a href="{{ config.extra.pypi }}" rel="noopener">PyPI</a>
+      <a href="{{ config.extra.api_docs }}" rel="noopener">docs.rs</a>
+    </nav>
+  </div>
+</footer>
+
+<dialog id="search-dialog" aria-label="Search documentation">
+  <form method="dialog" class="search-head">
+    <input id="search-input" type="search" placeholder="Search the documentation…" autocomplete="off" spellcheck="false" aria-label="Search query">
+    <button value="close" class="icon-btn" aria-label="Close search">Esc</button>
+  </form>
+  <ul id="search-results" role="listbox" aria-label="Search results"></ul>
+  <p id="search-empty" class="muted" hidden>No matches.</p>
+</dialog>
+
+<script>
+  window.HYPERTOR_SEARCH_INDEX = "{{ get_url(path='search_index.en.json') }}";
+</script>
+<script src="{{ get_url(path='site.js') }}" defer></script>
+</body>
+</html>

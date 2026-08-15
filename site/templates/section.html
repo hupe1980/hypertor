@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block body %}
+<div class="layout">
+
+  <aside class="sidebar" aria-label="Documentation">
+    <nav>
+      <p class="sidebar-title">Documentation</p>
+      <ul>
+        {%- for p in section.pages %}
+        <li><a href="{{ p.permalink }}">{{ p.title }}</a></li>
+        {%- endfor %}
+      </ul>
+    </nav>
+  </aside>
+
+  <main id="main" class="doc">
+    <article>
+      <h1>{{ section.title }}</h1>
+      {%- if section.description %}
+      <p class="lede">{{ section.description }}</p>
+      {%- endif %}
+      {{ section.content | safe }}
+
+      <div class="cards">
+        {%- for p in section.pages %}
+        <a class="card" href="{{ p.permalink }}">
+          <h2>{{ p.title }}</h2>
+          <p>{{ p.description }}</p>
+        </a>
+        {%- endfor %}
+      </div>
+    </article>
+  </main>
+
+</div>
+{% endblock body %}

@@ -19,21 +19,16 @@ async fn main() -> hypertor::Result<()> {
     println!("bootstrapping Tor...");
     let client = TorClient::new().await?;
 
-    let config = SocksConfig::default();
-    println!("SOCKS5 proxy on {}\n", config.bind_addr);
-    println!(
-        "  curl --socks5-hostname {} https://check.torproject.org/api/ip",
-        config.bind_addr
-    );
-    println!("\nDifferent SOCKS credentials get different circuits:");
-    println!(
-        "  curl -x socks5h://alice:x@{} https://check.torproject.org/api/ip",
-        config.bind_addr
-    );
-    println!(
-        "  curl -x socks5h://bob:x@{}   https://check.torproject.org/api/ip",
-        config.bind_addr
-    );
+    // Binding first means the address is known before anything is served,
+    // which matters when the configured port is 0.
+    let proxy = SocksProxy::from_client(&client, SocksConfig::default()).await?;
+    let addr = proxy.local_addr()?;
 
-    SocksProxy::from_client(&client, config).run().await
+    println!("SOCKS5 proxy on {addr}\n");
+    println!("  curl --socks5-hostname {addr} https://check.torproject.org/api/ip");
+    println!("\nDifferent SOCKS credentials get different circuits:");
+    println!("  curl -x socks5h://alice:x@{addr} https://check.torproject.org/api/ip");
+    println!("  curl -x socks5h://bob:x@{addr}   https://check.torproject.org/api/ip");
+
+    proxy.serve().await
 }

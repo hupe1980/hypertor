@@ -11,9 +11,11 @@
 
 use std::hint::black_box;
 
+use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use http_body_util::Full;
 
-use hypertor::body::{Encoding, decode};
+use hypertor::Streaming;
 
 fn gzip(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
@@ -22,42 +24,82 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("finishes")
 }
 
+/// Read a body through the real decoding path, exactly as a response does.
+async fn read(data: Bytes, encoding: Option<&str>, limit: usize) -> usize {
+    let mut builder = http::Response::builder().status(200);
+    if let Some(encoding) = encoding {
+        builder = builder.header("content-encoding", encoding);
+    }
+    let response = builder.body(Full::new(data)).expect("valid response");
+
+    Streaming::from_response(response, limit)
+        .expect("splits")
+        .buffered()
+        .await
+        .expect("decodes")
+        .len()
+}
+
 /// Body decoding is the one place hypertor touches every byte of a response.
 fn bench_body_decoding(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+
     let mut group = c.benchmark_group("body_decoding");
 
     for size in [1024usize, 64 * 1024, 1024 * 1024] {
-        let payload = vec![b'a'; size];
-        let compressed = gzip(&payload);
+        let payload = Bytes::from(vec![b'a'; size]);
+        let compressed = Bytes::from(gzip(&payload));
         let limit = size * 2;
 
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_function(format!("identity/{size}"), |b| {
-            b.iter(|| black_box(decode(black_box(&payload), Encoding::Identity, limit)))
+            b.iter(|| {
+                runtime.block_on(async { black_box(read(payload.clone(), None, limit).await) })
+            })
         });
 
         group.bench_function(format!("gzip/{size}"), |b| {
-            b.iter(|| black_box(decode(black_box(&compressed), Encoding::Gzip, limit)))
+            b.iter(|| {
+                runtime.block_on(async {
+                    black_box(read(compressed.clone(), Some("gzip"), limit).await)
+                })
+            })
         });
     }
 
     group.finish();
 }
 
-/// Redirect resolution runs once per hop and does string work.
-fn bench_redirect_resolution(c: &mut Criterion) {
+/// Redirect evaluation runs once per hop and does string work.
+///
+/// The policy and both URIs are built outside the loop on purpose: constructing
+/// them inside it measured `Uri::from_str`, which is `http`'s code and not
+/// something hypertor can make faster.
+fn bench_redirect_evaluation(c: &mut Criterion) {
     use http::Uri;
 
+    let policy = hypertor::RedirectPolicy::default();
     let base: Uri = "http://example.onion/a/b/c?q=1".parse().expect("valid");
 
-    c.bench_function("redirect/absolute", |b| {
-        b.iter(|| {
-            let policy = hypertor::RedirectPolicy::default();
-            let target: Uri = "http://example.onion/other".parse().expect("valid");
-            black_box(policy.evaluate(black_box(&base), black_box(&target)))
-        })
+    let same_origin: Uri = "http://example.onion/other".parse().expect("valid");
+    let cross_origin: Uri = "https://elsewhere.example/other".parse().expect("valid");
+
+    let mut group = c.benchmark_group("redirect");
+
+    group.bench_function("same_origin", |b| {
+        b.iter(|| black_box(policy.evaluate(black_box(&base), black_box(&same_origin))))
     });
+
+    // The refusal path: an onion origin pointing out to clearnet, which is the
+    // check that must never become expensive enough to be worth skipping.
+    group.bench_function("onion_to_clearnet", |b| {
+        b.iter(|| black_box(policy.evaluate(black_box(&base), black_box(&cross_origin))))
+    });
+
+    group.finish();
 }
 
 /// Request construction, which happens once per attempt.
@@ -77,7 +119,7 @@ fn bench_request_building(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_body_decoding,
-    bench_redirect_resolution,
+    bench_redirect_evaluation,
     bench_request_building
 );
 criterion_main!(benches);

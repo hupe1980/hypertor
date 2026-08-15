@@ -1,0 +1,49 @@
+[package]
+name = "hypertor-python"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["hupe1980"]
+repository = "https://github.com/hupe1980/hypertor"
+license = "MIT"
+description = "Python bindings for hypertor (built by maturin, not published to crates.io)"
+
+# This crate exists only to be compiled into a Python extension module. It has
+# no Rust API of its own, its version is the Python package's version rather
+# than the library's, and publishing it to crates.io would mean every Rust user
+# browsing `hypertor` also saw a pyo3 dependency they can never use.
+publish = false
+
+[lib]
+# Named for the module it becomes: maturin installs the artifact as
+# `hypertor/_hypertor.<ext>` inside the wheel (see `[tool.maturin]` in
+# ../../pyproject.toml), and the name must match the `#[pymodule]` function.
+name = "_hypertor"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The library, used through its public API exactly as any other consumer would.
+# Nothing here reaches into hypertor's internals; if the bindings need something
+# that is not public, that is a signal the Rust API is missing it.
+hypertor = { path = "../..", default-features = false, features = [
+    "client",
+    "server",
+    "rustls",
+] }
+
+# `extension-module` is added by maturin rather than declared here, so that
+# `cargo build`/`cargo test` in this workspace link against libpython and work.
+# Under `extension-module` the CPython symbols are left for a loading
+# interpreter to supply, which is correct in a wheel and a link error anywhere
+# else — including in a test binary.
+pyo3 = { version = "0.29", optional = false }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+
+http = "1.2"
+parking_lot = "0.12.5"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tracing = "0.1"
+
+# `panic = "abort"` must never be set for this crate: it is loaded into a host
+# interpreter, and a Rust panic has to be caught at the FFI boundary rather than
+# taking the whole Python process down with it.

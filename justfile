@@ -7,25 +7,33 @@ default:
 check: fmt-check lint test
 
 # Everything CI runs
-check-all: fmt-check lint test test-py docs audit
+check-all: fmt-check lint test test-py-rs test-features test-py typecheck-py docs site-build audit
 
 # Format
 fmt:
     cargo fmt --all
-    uvx ruff format python/ python_examples/
+    cd bindings/python && uvx ruff format hypertor/ tests/ examples/
 
 fmt-check:
     cargo fmt --all -- --check
-    uvx ruff format --check python/ python_examples/
+    cd bindings/python && uvx ruff format --check hypertor/ tests/ examples/
 
 # Lint
 lint:
     cargo clippy --all-targets --features full -- -D warnings
-    uvx ruff check python/ python_examples/
+    cargo clippy -p hypertor-python --all-targets -- -D warnings
+    cd bindings/python && uvx ruff check hypertor/ tests/ examples/
 
-# Rust tests (offline)
+# Rust tests (offline). The bindings are a separate crate and need an
+# interpreter to link against, so they are a target of their own; see test-py-rs.
 test:
     cargo test --features full
+
+# The bindings crate's own Rust tests: the handler-return-value contract the
+# Python OnionApp rests on. Needs a Python whose libdir exists — set PYO3_PYTHON
+# if the default interpreter is a stub (macOS ships one under Xcode).
+test-py-rs:
+    cargo test -p hypertor-python
 
 # Tests that need a live Tor connection
 test-live:
@@ -33,14 +41,19 @@ test-live:
 
 # Python tests (offline)
 test-py: build-py
-    uv run pytest python/tests -v
+    cd bindings/python && uv run pytest -v
 
 # Python tests including live network
 test-py-live: build-py
-    uv run pytest python/tests -v -m network
+    cd bindings/python && uv run pytest -v -m network
+
+# Type-check the Python stubs
+typecheck-py:
+    cd bindings/python && uv run mypy hypertor
 
 # Feature-combination checks
 test-features:
+    cargo check --no-default-features
     cargo check --no-default-features --features "client,rustls"
     cargo check --no-default-features --features "client,native-tls"
     cargo check --no-default-features --features "server,rustls"
@@ -62,28 +75,34 @@ audit:
 bench:
     cargo bench --features full
 
-# Python extension
+# Python extension. Everything for the bindings — the Rust crate, the Python
+# package, its tests, examples and pyproject.toml — lives in bindings/python.
 build-py:
-    maturin develop --features python
+    cd bindings/python && maturin develop
 
 build-py-release:
-    maturin build --release --features python
+    cd bindings/python && maturin build --release
 
 # Examples
 example name="client":
     cargo run --example {{name}} --features full
 
-# Documentation site
+# Documentation site (Zola). Install with: brew install zola
 site:
-    cd docs && bundle exec jekyll serve --livereload --config _config.yml,_config_dev.yml
+    cd site && zola serve
 
-site-setup:
-    cd docs && bundle install
+site-build:
+    cd site && zola build
+
+# Fails on a broken internal link, which is what documentation actually suffers
+# from. External links are checked too, so this needs the network.
+site-check:
+    cd site && zola check
 
 # Dev environment
 setup:
-    uv sync --all-extras
+    cd bindings/python && uv sync --all-extras
 
 clean:
     cargo clean
-    rm -rf target/ dist/ *.egg-info/ docs/_site/
+    rm -rf target/ dist/ *.egg-info/ site/public/

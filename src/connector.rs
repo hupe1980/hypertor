@@ -77,7 +77,55 @@ impl Target {
 
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
 
-        Ok(Self { host, port, tls })
+        let target = Self { host, port, tls };
+        target.check_onion_address()?;
+        Ok(target)
+    }
+
+    /// Reject an `.onion` name that cannot possibly resolve.
+    ///
+    /// arti would refuse these too, but only after the URL has travelled
+    /// through the pool and the connector, where the failure reads as a network
+    /// problem rather than a typo. The v2 case is worth naming outright: those
+    /// addresses used 1024-bit RSA and SHA-1, were retired from the network in
+    /// 2021, and someone holding one has stale information rather than a broken
+    /// setup.
+    fn check_onion_address(&self) -> Result<()> {
+        if !self.is_onion() {
+            return Ok(());
+        }
+
+        let label = self
+            .host
+            .rsplit_once('.')
+            .map(|(label, _)| label)
+            .unwrap_or(&self.host);
+        // Only the last label before `.onion` is the address itself.
+        let label = label.rsplit('.').next().unwrap_or(label);
+
+        // v3 addresses are 56 characters of base32 (a 32-byte key, a 2-byte
+        // checksum and a version byte).
+        if label.len() == 56
+            && label.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)
+            })
+        {
+            return Ok(());
+        }
+
+        if label.len() == 16 {
+            return Err(Error::invalid_url(
+                "this is a version 2 onion address; v2 onion services were \
+                 retired from the Tor network in 2021 and cannot be reached. \
+                 The service may publish a 56-character v3 address instead",
+            ));
+        }
+
+        Err(Error::invalid_url(format!(
+            "`{label}.onion` is not a valid onion address: expected 56 \
+             characters of base32, found {}",
+            label.len()
+        )))
     }
 
     /// Whether this target is an onion service.
@@ -239,9 +287,12 @@ mod tests {
         s.parse().expect("test URI parses")
     }
 
+    /// A syntactically valid v3 onion address (56 characters of base32).
+    const V3: &str = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad";
+
     #[test]
     fn parses_default_ports() {
-        let http = Target::from_uri(&uri("http://example.onion/x")).expect("valid");
+        let http = Target::from_uri(&uri(&format!("http://{V3}.onion/x"))).expect("valid");
         assert_eq!(http.port, 80);
         assert!(!http.tls);
 
@@ -252,7 +303,7 @@ mod tests {
 
     #[test]
     fn honours_explicit_ports() {
-        let t = Target::from_uri(&uri("http://example.onion:8080/")).expect("valid");
+        let t = Target::from_uri(&uri(&format!("http://{V3}.onion:8080/"))).expect("valid");
         assert_eq!(t.port, 8080);
     }
 
@@ -267,7 +318,7 @@ mod tests {
         // A silently-ignored scheme is how requests end up going somewhere the
         // caller did not intend.
         assert!(Target::from_uri(&uri("ftp://example.com/")).is_err());
-        assert!(Target::from_uri(&uri("ws://example.onion/socket")).is_err());
+        assert!(Target::from_uri(&uri(&format!("ws://{V3}.onion/socket"))).is_err());
     }
 
     #[test]
@@ -279,12 +330,12 @@ mod tests {
     #[test]
     fn detects_onion_addresses() {
         assert!(
-            Target::from_uri(&uri("http://abc.onion/"))
+            Target::from_uri(&uri(&format!("http://{V3}.onion/")))
                 .expect("valid")
                 .is_onion()
         );
         assert!(
-            Target::from_uri(&uri("http://ABC.ONION/"))
+            Target::from_uri(&uri(&format!("http://{}.ONION/", V3.to_uppercase())))
                 .expect("valid")
                 .is_onion()
         );
@@ -298,5 +349,29 @@ mod tests {
                 .expect("valid")
                 .is_onion()
         );
+    }
+
+    #[test]
+    fn a_v3_onion_address_with_a_subdomain_is_accepted() {
+        // Onion services routinely publish virtual hosts under the address.
+        assert!(Target::from_uri(&uri(&format!("http://www.{V3}.onion/"))).is_ok());
+    }
+
+    #[test]
+    fn version_2_onion_addresses_are_refused_by_name() {
+        // v2 used 1024-bit RSA and SHA-1 and left the network in 2021. Letting
+        // it fail as a connection error would send the caller looking for a
+        // network problem that does not exist.
+        let err = Target::from_uri(&uri("http://expyuzz4wqqyqhjn.onion/")).expect_err("refused");
+        assert!(err.to_string().contains("version 2"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn a_malformed_onion_address_is_refused_before_a_circuit_is_built() {
+        // Otherwise the typo surfaces seconds later as an opaque connect
+        // failure, having cost a circuit.
+        for bad in ["http://nonsense.onion/", "http://TOO-SHORT.onion/"] {
+            assert!(Target::from_uri(&uri(bad)).is_err(), "should refuse {bad}");
+        }
     }
 }

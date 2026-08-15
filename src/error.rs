@@ -87,6 +87,21 @@ pub enum Error {
         source: Option<BoxedError>,
     },
 
+    /// The server answered, but with a status the caller rejected.
+    ///
+    /// Produced only by `error_for_status`. It carries the [`StatusCode`] so
+    /// callers can branch on it — `404` and `503` usually deserve different
+    /// handling, and forcing a string match to tell them apart would be poor.
+    ///
+    /// [`StatusCode`]: http::StatusCode
+    #[error("server returned {status} {reason}")]
+    Status {
+        /// The status code the server sent.
+        status: http::StatusCode,
+        /// Its canonical reason phrase, if it has one.
+        reason: String,
+    },
+
     /// The request could not be built or was rejected before being sent.
     #[error("invalid request: {message}")]
     InvalidRequest {
@@ -127,6 +142,16 @@ pub enum Error {
         message: String,
     },
 
+    /// A request body failed while being streamed.
+    #[error("request body error: {message}")]
+    Body {
+        /// What went wrong.
+        message: String,
+        /// The underlying failure from the caller's stream.
+        #[source]
+        source: Option<BoxedError>,
+    },
+
     // ------------------------------------------------------------------
     // Timing
     // ------------------------------------------------------------------
@@ -163,7 +188,11 @@ pub enum Error {
     },
 
     /// An underlying I/O operation failed.
-    #[error("I/O error")]
+    ///
+    /// The message is inlined rather than left to the `source` chain: most
+    /// logging setups print only the top-level `Display`, and a bare
+    /// "I/O error" tells nobody anything.
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
 
@@ -184,16 +213,24 @@ impl Error {
 
     /// Whether retrying the same request has a realistic chance of succeeding.
     ///
-    /// Circuit and connection failures are transient by nature — Tor will pick a
-    /// different path on the next attempt. Configuration and request-shape
-    /// errors are not retryable, and neither are timeouts of the *whole*
-    /// operation, since the caller's deadline has already passed.
+    /// Connection-level failures are transient by nature: the next attempt
+    /// opens a new stream, and under
+    /// [`IsolationLevel::PerRequest`](crate::IsolationLevel::PerRequest) a new
+    /// circuit as well, so a bad relay is routed around rather than hit again.
+    /// Configuration and request-shape errors are not retryable, and neither
+    /// are timeouts of the *whole* operation, since the caller's deadline has
+    /// already passed.
     pub fn is_retryable(&self) -> bool {
         match self {
+            // A stream that could not be opened, or whose TLS handshake failed,
+            // says nothing about the request itself.
             Error::Connect { .. } | Error::TlsHandshake { .. } => true,
+            // Framing and keep-alive failures: usually a pooled connection the
+            // peer had already closed.
             Error::Http { .. } => true,
-            Error::Bootstrap { .. } => false,
-            Error::Timeout { .. } => false,
+            // Bootstrap failed, the caller's deadline has passed, the body
+            // stream is consumed, or the request itself is wrong. None of these
+            // get better by trying again.
             _ => false,
         }
     }
@@ -208,6 +245,14 @@ impl Error {
         matches!(self, Error::Timeout { .. })
     }
 
+    /// The HTTP status, for errors produced by `error_for_status`.
+    pub fn status(&self) -> Option<http::StatusCode> {
+        match self {
+            Error::Status { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
     /// Rebuild an owned error of the same kind from a borrowed one.
     ///
     /// hyper boxes our connector errors behind `dyn Error`, so a failed request
@@ -217,6 +262,7 @@ impl Error {
     /// report the wrong thing for exactly the failures that matter most.
     ///
     /// The underlying source is dropped; its message is folded into the text.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn same_kind(&self) -> Error {
         let detail = || {
             std::error::Error::source(self)
@@ -257,6 +303,22 @@ impl Error {
             Error::Config { message } => Error::Config {
                 message: message.clone(),
             },
+            Error::Decode { message } => Error::Decode {
+                message: message.clone(),
+            },
+            Error::Body { message, .. } => Error::Body {
+                message: message.clone(),
+                source: Some(Box::new(Detail(detail()))),
+            },
+            Error::BodyTooLarge { size, limit } => Error::BodyTooLarge {
+                size: *size,
+                limit: *limit,
+            },
+            Error::TooManyRedirects { limit } => Error::TooManyRedirects { limit: *limit },
+            Error::Status { status, reason } => Error::Status {
+                status: *status,
+                reason: reason.clone(),
+            },
             // Anything else keeps its message but becomes a generic HTTP
             // failure, which is a safe classification: not retryable.
             other => Error::Http {
@@ -265,11 +327,15 @@ impl Error {
             },
         }
     }
+}
 
-    // ------------------------------------------------------------------
-    // Constructors (crate-internal ergonomics)
-    // ------------------------------------------------------------------
-
+/// Crate-internal constructors.
+///
+/// Which of these are reachable depends on the feature set — a `server`-only
+/// build never opens an outbound connection, for instance — so they are grouped
+/// here rather than carrying a `cfg` apiece.
+#[allow(dead_code)]
+impl Error {
     pub(crate) fn bootstrap<E>(message: impl Into<String>, source: E) -> Self
     where
         E: std::error::Error + Send + Sync + 'static,
@@ -377,6 +443,7 @@ impl Error {
 
 /// Carries a rendered message where the original source cannot be cloned.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct Detail(pub(crate) String);
 
 impl std::fmt::Display for Detail {

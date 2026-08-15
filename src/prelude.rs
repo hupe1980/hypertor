@@ -17,11 +17,13 @@ pub use crate::isolation::{IsolatedSession, IsolationLevel, IsolationToken};
 pub use crate::redirect::RedirectPolicy;
 
 #[cfg(feature = "client")]
+pub use crate::body::Body;
+#[cfg(feature = "client")]
 pub use crate::client::{TorClient, TorClientBuilder};
 #[cfg(feature = "client")]
 pub use crate::request::RequestBuilder;
 #[cfg(feature = "client")]
-pub use crate::response::Response;
+pub use crate::response::{Response, Streaming};
 
 #[cfg(feature = "server")]
 pub use crate::onion_service::{OnionService, OnionServiceBuilder};
@@ -31,4 +33,4 @@ pub use crate::serve::{OnionApp, Request as ServeRequest, Response as ServeRespo
 #[cfg(feature = "socks")]
 pub use crate::socks::{SocksConfig, SocksProxy};
 #[cfg(feature = "ws")]
-pub use crate::websocket::{Message as WsMessage, TorWebSocket};
+pub use crate::websocket::{Close as WsClose, Message as WsMessage, TorWebSocket};

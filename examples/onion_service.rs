@@ -34,14 +34,15 @@ async fn main() -> hypertor::Result<()> {
             match req.text() {
                 Ok(body) => ServeResponse::json(&serde_json::json!({"received": body})),
                 Err(e) => {
-                    ServeResponse::status(http::StatusCode::BAD_REQUEST).with_body(e.to_string())
+                    ServeResponse::new(http::StatusCode::BAD_REQUEST).with_body(e.to_string())
                 }
             }
         });
 
-    // `state_dir` is what keeps the .onion address stable across restarts:
-    // the address is derived from a key arti stores there. Without it you get a
-    // brand-new address every time.
+    // The nickname is the identity: the address is derived from a key arti
+    // files under it. Relaunching with the same nickname republishes the same
+    // .onion address — including without `state_dir`, which only chooses *where*
+    // that key lives rather than whether it is kept.
     let service = OnionService::builder()
         .nickname("hypertor-example")?
         .state_dir("./onion-state")
@@ -55,8 +56,12 @@ async fn main() -> hypertor::Result<()> {
     let serving = app.serve_on(service).await?;
 
     println!("\n  🧅 {}\n", serving.onion_address());
-    println!("  reach it with:");
-    println!("    torsocks curl http://{}/", serving.onion_address());
+    println!("  reach it with any Tor-capable client, for example:");
+    println!(
+        "    curl --socks5-hostname 127.0.0.1:9050 http://{}/",
+        serving.onion_address()
+    );
+    println!("  (run `cargo run --example socks_proxy` for that proxy)\n");
 
     serving.wait().await
 }

@@ -74,6 +74,16 @@ impl RedirectPolicy {
             return RedirectAction::Stop;
         }
 
+        // A `Location` naming something Tor cannot carry — `mailto:`,
+        // `javascript:`, `file:` — is refused here, where the message can say
+        // so, rather than several layers down in the connector where it would
+        // surface as a confusing URL-parsing failure.
+        if !matches!(to.scheme_str(), Some("http") | Some("https")) {
+            return RedirectAction::Refuse(
+                "refusing to follow a redirect to a scheme other than http:// or https://",
+            );
+        }
+
         if is_onion(from) && !is_onion(to) && !self.allow_onion_to_clearnet {
             return RedirectAction::Refuse(
                 "refusing to follow a redirect from an onion service to a clearnet host; \
@@ -127,6 +137,7 @@ fn same_origin(a: &Uri, b: &Uri) -> bool {
 }
 
 /// Remove headers that must not cross an origin boundary.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 pub(crate) fn strip_sensitive_headers(headers: &mut HeaderMap) {
     headers.remove(AUTHORIZATION);
     headers.remove(PROXY_AUTHORIZATION);
@@ -136,6 +147,7 @@ pub(crate) fn strip_sensitive_headers(headers: &mut HeaderMap) {
 /// Resolve a `Location` value against the URI it was returned from.
 ///
 /// Handles absolute URLs, absolute paths and relative paths.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 pub(crate) fn resolve(base: &Uri, location: &str) -> Option<Uri> {
     let location = location.trim();
     if location.is_empty() {
@@ -153,7 +165,7 @@ pub(crate) fn resolve(base: &Uri, location: &str) -> Option<Uri> {
     let scheme = parts.scheme?;
     let authority = parts.authority?;
 
-    let path_and_query = if let Some(stripped) = location.strip_prefix("//") {
+    let reference = if let Some(stripped) = location.strip_prefix("//") {
         // Protocol-relative: //host/path
         return format!("{}://{}", scheme.as_str(), stripped).parse().ok();
     } else if location.starts_with('/') {
@@ -168,14 +180,66 @@ pub(crate) fn resolve(base: &Uri, location: &str) -> Option<Uri> {
         format!("{dir}{location}")
     };
 
-    format!(
+    // Split the query off before normalising: `.` and `..` are path grammar and
+    // mean nothing inside a query string.
+    let (path, query) = match reference.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (reference.as_str(), None),
+    };
+
+    let mut resolved = format!(
         "{}://{}{}",
         scheme.as_str(),
         authority.as_str(),
-        path_and_query
-    )
-    .parse()
-    .ok()
+        remove_dot_segments(path)
+    );
+    if let Some(query) = query {
+        resolved.push('?');
+        resolved.push_str(query);
+    }
+
+    resolved.parse().ok()
+}
+
+/// Apply RFC 3986 §5.2.4 `remove_dot_segments` to a path.
+///
+/// Without this, `Location: ../elsewhere` from `/a/b/c` produces the literal
+/// path `/a/b/../elsewhere` and it is sent to the server that way. Two clients
+/// disagreeing with the server about what a path means is the shape of every
+/// path-confusion bug, and here it would also make hypertor's own same-origin
+/// and traversal reasoning operate on a path nobody else sees.
+fn remove_dot_segments(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            // Popping past the root is not an escape: RFC 3986 discards it.
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+
+    // A path ending in `/`, `/.` or `/..` names a directory, and that has to
+    // survive normalisation. Deciding it from the original path rather than
+    // tracking it through the loop is what keeps `/dir/` from becoming `/dir` —
+    // which matters because `/dir` -> `/dir/` is the single most common
+    // redirect on the web, and answering it with `/dir` again is an infinite
+    // loop that only shows up against a real server.
+    let directory =
+        path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..") || out.is_empty();
+
+    let mut normalised = String::with_capacity(path.len() + 1);
+    for segment in &out {
+        normalised.push('/');
+        normalised.push_str(segment);
+    }
+    if directory {
+        normalised.push('/');
+    }
+    normalised
 }
 
 #[cfg(test)]
@@ -311,7 +375,82 @@ mod tests {
     }
 
     #[test]
+    fn resolves_dot_segments_rather_than_passing_them_on() {
+        // `/dir/../up` reaching the wire is how a client and a server end up
+        // disagreeing about which resource was requested.
+        let base = uri("http://a.onion/one/two/page");
+        assert_eq!(
+            resolve(&base, "../up").unwrap(),
+            uri("http://a.onion/one/up")
+        );
+        assert_eq!(
+            resolve(&base, "./beside").unwrap(),
+            uri("http://a.onion/one/two/beside")
+        );
+        assert_eq!(
+            resolve(&base, "/a/b/../c").unwrap(),
+            uri("http://a.onion/a/c")
+        );
+        assert_eq!(resolve(&base, "..").unwrap(), uri("http://a.onion/one/"));
+    }
+
+    #[test]
+    fn normalisation_keeps_a_trailing_slash() {
+        // `/dir` -> `/dir/` is the most common redirect on the web. Normalising
+        // the target back to `/dir` would answer it with the request that
+        // caused it, which loops until the hop limit and only ever shows up
+        // against a real server.
+        let base = uri("http://a.onion/dir");
+        assert_eq!(
+            resolve(&base, "/dir/").unwrap(),
+            uri("http://a.onion/dir/"),
+            "a directory redirect must stay a directory"
+        );
+        assert_eq!(
+            resolve(&base, "/one/two/").unwrap(),
+            uri("http://a.onion/one/two/")
+        );
+        assert_eq!(resolve(&base, "/").unwrap(), uri("http://a.onion/"));
+    }
+
+    #[test]
+    fn dot_segments_cannot_climb_above_the_root() {
+        // RFC 3986 §5.2.4 discards the excess rather than escaping the origin.
+        let base = uri("http://a.onion/one");
+        assert_eq!(
+            resolve(&base, "/../../../etc/passwd").unwrap(),
+            uri("http://a.onion/etc/passwd")
+        );
+    }
+
+    #[test]
+    fn normalisation_leaves_the_query_string_alone() {
+        // `..` inside a query is data, not path grammar.
+        let base = uri("http://a.onion/one/two");
+        assert_eq!(
+            resolve(&base, "/search?q=../../secret").unwrap(),
+            uri("http://a.onion/search?q=../../secret")
+        );
+    }
+
+    #[test]
     fn empty_location_is_not_a_redirect() {
         assert!(resolve(&uri("http://a.onion/"), "   ").is_none());
+    }
+
+    #[test]
+    fn redirects_to_other_schemes_are_refused_with_a_useful_message() {
+        // Without this the failure surfaces from the connector as "unsupported
+        // scheme", which reads like a bug in the caller's own URL.
+        let policy = RedirectPolicy::default();
+        for target in ["mailto:someone@example.com", "javascript:alert(1)"] {
+            assert!(
+                matches!(
+                    policy.evaluate(&uri("https://example.com/"), &uri(target)),
+                    RedirectAction::Refuse(_)
+                ),
+                "should refuse {target}"
+            );
+        }
     }
 }

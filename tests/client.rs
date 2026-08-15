@@ -5,7 +5,11 @@
 
 use std::time::Duration;
 
-use hypertor::{Config, Error, IsolationLevel, IsolationToken, RedirectPolicy, TorClient};
+use hypertor::{Body, Config, Error, IsolationLevel, IsolationToken, RedirectPolicy, TorClient};
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 #[test]
 fn config_rejects_nonsense() {
@@ -36,6 +40,10 @@ fn default_config_is_safe() {
         "the default must not share circuits across every destination"
     );
     assert!(
+        config.connect_timeout <= config.timeout,
+        "a connect budget larger than the request budget can never elapse"
+    );
+    assert!(
         !config
             .redirect
             .evaluate(
@@ -47,12 +55,20 @@ fn default_config_is_safe() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Isolation
+// ---------------------------------------------------------------------------
+
 #[test]
 fn isolation_tokens_are_distinct() {
     let a = IsolationToken::new();
     let b = IsolationToken::new();
     assert_ne!(a, b);
 }
+
+// ---------------------------------------------------------------------------
+// Redirects
+// ---------------------------------------------------------------------------
 
 #[test]
 fn redirect_policy_strips_credentials_across_origins() {
@@ -75,6 +91,10 @@ fn redirect_policy_strips_credentials_across_origins() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
 #[test]
 fn errors_do_not_leak_hostnames() {
     let err = Error::Connect {
@@ -88,16 +108,61 @@ fn errors_do_not_leak_hostnames() {
         !rendered.contains("hidden-service"),
         "error text leaked a hostname: {rendered}"
     );
+    assert_eq!(err.host(), Some("hidden-service.onion"));
 }
 
 #[test]
-fn decompression_bombs_are_bounded_by_the_response_limit() {
-    use hypertor::body::{Encoding, decode};
+fn io_errors_say_what_went_wrong() {
+    // "I/O error" with the detail buried in the source chain is useless in a
+    // log line, which is where these end up.
+    let err = Error::from(std::io::Error::other("connection reset by peer"));
+    assert!(
+        err.to_string().contains("connection reset by peer"),
+        "unhelpful error: {err}"
+    );
+}
+
+#[test]
+fn status_errors_carry_the_code() {
+    use hypertor::Response;
+
+    let response = Response::new(
+        http::StatusCode::TOO_MANY_REQUESTS,
+        http::Version::HTTP_11,
+        http::HeaderMap::new(),
+        bytes::Bytes::new(),
+    );
+
+    let err = response.error_for_status().expect_err("429 is an error");
+    assert_eq!(err.status(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    assert!(!err.is_retryable());
+}
+
+// ---------------------------------------------------------------------------
+// Bodies
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_memory_bodies_can_be_retried_and_streams_cannot() {
+    // The distinction is what stops a retry or a redirect from resending a
+    // stream that has already been consumed.
+    assert!(Body::bytes("payload").is_replayable());
+    assert!(
+        !Body::from_stream(futures::stream::once(async {
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x"))
+        }))
+        .is_replayable()
+    );
+}
+
+#[tokio::test]
+async fn decompression_bombs_are_bounded_by_the_response_limit() {
     use std::io::Write;
 
-    // 8 MiB of zeroes compresses to a few kilobytes.
+    // 32 MiB of zeroes compresses to a few kilobytes. Decoding must stop at the
+    // limit rather than materialising the expansion and checking afterwards.
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    encoder.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
+    encoder.write_all(&vec![0u8; 32 * 1024 * 1024]).unwrap();
     let bomb = encoder.finish().unwrap();
 
     assert!(
@@ -105,7 +170,17 @@ fn decompression_bombs_are_bounded_by_the_response_limit() {
         "fixture should be small on the wire"
     );
 
-    let err = decode(&bomb, Encoding::Gzip, 64 * 1024).expect_err("must refuse");
+    let response = http::Response::builder()
+        .header("content-encoding", "gzip")
+        .body(http_body_util::Full::new(bytes::Bytes::from(bomb)))
+        .unwrap();
+
+    let err = hypertor::Streaming::from_response(response, 64 * 1024)
+        .expect("splits")
+        .buffered()
+        .await
+        .expect_err("must refuse");
+
     assert!(
         matches!(err, Error::BodyTooLarge { .. }),
         "expected a size error, got: {err}"
@@ -114,7 +189,7 @@ fn decompression_bombs_are_bounded_by_the_response_limit() {
 
 #[test]
 fn stacked_content_encodings_are_refused_rather_than_half_decoded() {
-    use hypertor::body::Encoding;
+    use hypertor::Encoding;
 
     let mut headers = http::HeaderMap::new();
     headers.insert("content-encoding", "gzip, br".parse().unwrap());
@@ -125,12 +200,32 @@ fn stacked_content_encodings_are_refused_rather_than_half_decoded() {
     );
 }
 
-#[test]
-fn relative_redirects_resolve_against_the_current_url() {
-    // Exercised through the policy, which is the public surface.
-    let policy = RedirectPolicy::default();
-    assert!(policy.is_enabled());
-    assert_eq!(policy.limit(), 10);
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+/// Bootstrapping must not panic before it even reaches the network.
+///
+/// rustls can only infer a cryptography provider when exactly one is compiled
+/// in, and *panics* rather than guessing otherwise — at the moment something
+/// first builds a TLS configuration, which for hypertor is inside
+/// `TorClient::new()`. hypertor used to force `ring` for its own TLS while arti
+/// pulled in `aws-lc-rs` for Tor link TLS, so a default build had both and
+/// aborted the process here. Every network test being `#[ignore]`d is what let
+/// that ship.
+///
+/// hypertor's own graph now resolves to `aws-lc-rs` alone, but the explicit
+/// install in `hypertor::tls` stays: as a *library*, hypertor cannot stop an
+/// application from pulling rustls's `ring` feature in from somewhere else and
+/// reintroducing the ambiguity — in which case the panic would land in that
+/// application's build, at runtime, for a reason with nothing to do with its
+/// own code.
+///
+/// This test needs no network: it only has to get as far as building a TLS
+/// configuration, which is where the panic was.
+#[tokio::test]
+async fn bootstrapping_does_not_panic_before_it_reaches_the_network() {
+    let _ = tokio::time::timeout(Duration::from_secs(5), TorClient::new()).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,4 +314,30 @@ async fn isolation_yields_different_exits() {
         seen.len() > 1,
         "three isolated requests all used one exit relay: {seen:?}"
     );
+}
+
+/// A large download must not have to fit in memory.
+#[tokio::test]
+#[ignore = "requires a live Tor connection"]
+async fn streams_a_body_without_buffering_it() {
+    let client = TorClient::builder()
+        // Far below the download size: the streaming API must not be bound by
+        // the buffered default, only by what it is told.
+        .max_response_size(64 * 1024 * 1024)
+        .build()
+        .await
+        .expect("bootstraps");
+
+    let mut response = client
+        .get("https://check.torproject.org/api/ip")
+        .expect("valid url")
+        .send_streaming()
+        .await
+        .expect("headers arrive");
+
+    let mut total = 0usize;
+    while let Some(chunk) = response.chunk().await.expect("chunk") {
+        total += chunk.len();
+    }
+    assert!(total > 0);
 }

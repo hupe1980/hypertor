@@ -1,21 +1,39 @@
+[workspace]
+# The Python bindings live in their own crate so that the published `hypertor`
+# carries no pyo3 dependency, no `cdylib` artifact, and no feature that only
+# makes sense inside a wheel. See bindings/python/Cargo.toml.
+members = ["bindings/python"]
+
 [package]
 name = "hypertor"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
-rust-version = "1.86"
+# arti 0.45 requires Rust 1.91; hypertor cannot compile on anything older, so
+# claiming a lower floor here would only produce a confusing failure deep in a
+# dependency.
+rust-version = "1.91"
 authors = ["hupe1980"]
 repository = "https://github.com/hupe1980/hypertor"
 license = "MIT"
-description = "Tor HTTP client and onion service library with Python bindings"
+description = "Tor HTTP client and onion service library, built on arti and hyper"
 keywords = ["tor", "http", "privacy", "anonymity", "onion"]
 categories = ["network-programming", "web-programming::http-client"]
 publish = true
 
+# Everything outside the library itself: the bindings crate, the documentation
+# site and the Python package are all in the repository but none belong in the
+# published tarball.
+exclude = [
+    "bindings/",
+    "docs/",
+    ".github/",
+    ".devcontainer/",
+    "justfile",
+    "deny.toml",
+]
+
 [lib]
 name = "hypertor"
-# `cdylib` is only needed for the Python extension module; adding it
-# unconditionally would force a dylib build for pure-Rust consumers.
-crate-type = ["rlib"]
 
 [features]
 default = ["client", "rustls"]
@@ -26,7 +44,13 @@ default = ["client", "rustls"]
 # `socks`   — local SOCKS5 proxy front-end for the client.
 # `ws`      — WebSocket over Tor (tokio-tungstenite).
 client = []
-server = ["dep:tor-hsservice", "dep:tor-hscrypto", "dep:tor-cell", "dep:mime_guess"]
+server = [
+    "dep:tor-hsservice",
+    "dep:tor-hscrypto",
+    "dep:tor-cell",
+    "dep:tor-proto",
+    "dep:mime_guess",
+]
 
 # Proof-of-work DoS defence for onion services (Tor proposal 327, Equi-X).
 #
@@ -42,6 +66,12 @@ ws = ["client", "dep:tokio-tungstenite"]
 # rustls gives an identical TLS fingerprint on every platform. native-tls uses
 # the OS stack (OpenSSL / SecureTransport / SChannel) and therefore leaks the
 # host operating system to any observer of the TLS handshake.
+#
+# One of these is MANDATORY for `client` and for `server` alike: Tor's own link
+# protocol is TLS, so `tor-rtcompat` exposes no runtime without a backend. Cargo
+# features are additive and cannot express "requires one of", so src/lib.rs
+# carries a `compile_error!` that says this in as many words — the raw failure
+# is an unresolved import several crates away.
 rustls = [
     "dep:tokio-rustls",
     "dep:rustls-native-certs",
@@ -60,9 +90,6 @@ native-tls = [
 # Static SQLite: useful on Windows, where no system SQLite is available.
 static-sqlite = ["arti-client/static-sqlite"]
 
-# Python bindings (built by maturin).
-python = ["dep:pyo3", "dep:pyo3-async-runtimes", "client", "server"]
-
 # `full` deliberately excludes `pow`, to keep the default dependency tree
 # permissively licensed. Add "pow" explicitly if you need it.
 full = ["client", "server", "socks", "ws", "rustls"]
@@ -77,11 +104,14 @@ tracing = "0.1"
 # We plug a Tor connector into hyper-util's pooling client rather than
 # reimplementing any of it.
 hyper = { version = "1.8", features = ["http1", "http2", "client", "server"] }
-hyper-util = { version = "0.1.19", features = [
+hyper-util = { version = "0.1.20", features = [
     "tokio",
     "client",
     "client-legacy",
     "server",
+    # `server-auto` sniffs the HTTP/2 connection preface, so an onion service
+    # speaks h2c and HTTP/1.1 on the same port without prior knowledge.
+    "server-auto",
     "server-graceful",
     "service",
     "http1",
@@ -119,6 +149,12 @@ tor-hsservice = { version = "0.45", default-features = false, features = [
 ], optional = true }
 tor-hscrypto = { version = "0.45", optional = true }
 tor-cell = { version = "0.45", optional = true }
+# Needed to inspect the BEGIN cell of an inbound stream: an onion service that
+# does not check the requested virtual port is distinguishable from every other
+# implementation, which arti's own documentation calls out explicitly.
+tor-proto = { version = "0.45", default-features = false, features = [
+    "hs-service",
+], optional = true }
 
 # --- Async runtime -----------------------------------------------------------
 tokio = { version = "1", features = [
@@ -134,9 +170,19 @@ futures = "0.3"
 pin-project-lite = "0.2"
 
 # --- Content encodings -------------------------------------------------------
-flate2 = "1.1"
-brotli = "8"
-zstd = "0.13.3"
+# Response bodies are decompressed *as they stream*, which is what makes the
+# size limit a real defence against decompression bombs rather than a check that
+# runs after the damage is done.
+async-compression = { version = "0.4.43", default-features = false, features = [
+    "tokio",
+    "gzip",
+    # `deflate` responses are zlib-wrapped in practice, which is what RFC 9110
+    # specifies and what every other HTTP client assumes.
+    "zlib",
+    "brotli",
+    "zstd",
+] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["io"] }
 
 # --- Encoding ----------------------------------------------------------------
 base64 = "0.22"
@@ -144,7 +190,20 @@ form_urlencoded = "1.2"
 percent-encoding = "2.3"
 
 # --- TLS backends (feature-gated) --------------------------------------------
-tokio-rustls = { version = "0.26", features = ["ring"], optional = true }
+#
+# The crypto provider is deliberately left at tokio-rustls's default, which is
+# `aws-lc-rs`. hypertor used to force `ring` here, and because it did not also
+# set `default-features = false` the build ended up with *both* providers
+# compiled in — which is what made rustls unable to pick one, and what the
+# explicit provider install in `src/tls.rs` exists to paper over.
+#
+# Choosing `ring` on top of that was a downgrade: it has no post-quantum key
+# exchange, while `aws-lc-rs`'s defaults lead with the X25519MLKEM768 hybrid.
+# For a tool whose users are exactly the people a "record now, decrypt later"
+# adversary targets, that is the wrong side to be on. `aws-lc-rs` is also what
+# arti itself uses for Tor link TLS, so the whole process now speaks one
+# cryptographic stack rather than two.
+tokio-rustls = { version = "0.26", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
 
@@ -152,10 +211,6 @@ tokio-native-tls = { version = "0.3", optional = true }
 tokio-tungstenite = { version = "0.28", default-features = false, features = [
     "handshake",
 ], optional = true }
-
-# --- Python bindings (feature-gated) ----------------------------------------
-pyo3 = { version = "0.27", features = ["extension-module"], optional = true }
-pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"], optional = true }
 
 # --- Utilities ---------------------------------------------------------------
 parking_lot = "0.12.5"
@@ -167,21 +222,26 @@ mime_guess = { version = "2.0", optional = true }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 criterion = { version = "0.8", features = ["html_reports"] }
+# Compressing fixtures for the decompression-bomb and content-encoding tests.
+flate2 = "1.1"
 
 [[bench]]
 name = "benchmarks"
 harness = false
 
-# `panic = "abort"` is deliberately NOT set: this crate is built as a Python
-# extension module, and unwinding must be caught at the FFI boundary instead of
-# aborting the host interpreter.
+# `panic = "abort"` is deliberately NOT set: the Python bindings in
+# bindings/python are loaded into a host interpreter, and a panic must be caught
+# at the FFI boundary rather than aborting the interpreter. Profiles are set by
+# the workspace root, so this applies to them too.
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
 
 [package.metadata.docs.rs]
-all-features = true
+# Not `all-features`: `pow` is excluded for the same reason it is excluded from
+# `full` — it is LGPL-3.0 — and documents identically without it.
+features = ["full"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
@@ -207,6 +267,11 @@ required-features = ["socks"]
 [[example]]
 name = "bridges"
 path = "examples/bridges.rs"
+required-features = ["client"]
+
+[[example]]
+name = "streaming"
+path = "examples/streaming.rs"
 required-features = ["client"]
 
 [[example]]

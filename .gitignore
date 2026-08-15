@@ -20,6 +20,9 @@ Cargo.lock
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Zola build output
+site/public/
+
 # custom
 _prompts/
 FINDINGS.md
@@ -42,6 +45,9 @@ build/
 .pytest_cache/
 .ruff_cache/
 *.pyi.bak
-# Compiled Python extension modules
+# Compiled Python extension modules, and the debug symbols macOS leaves beside
+# them when `maturin develop` builds in place.
 *.so
+*.dylib
+*.dSYM/
 __pycache__/

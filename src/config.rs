@@ -11,8 +11,29 @@ use crate::redirect::RedirectPolicy;
 
 /// The User-Agent hypertor sends by default.
 ///
-/// This matches the Tor Browser's User-Agent so that hypertor requests blend
-/// into the largest available anonymity set rather than announcing themselves.
+/// This matches the Tor Browser's User-Agent, which is the most common one on
+/// the Tor network, so a hypertor request is not singled out by this field
+/// alone. [`Encoding::accept_encoding`](crate::Encoding::accept_encoding)
+/// advertises the same encodings in the same order as that browser for the same
+/// reason.
+///
+/// # This does not make you look like Tor Browser
+///
+/// It is worth being blunt about how far the resemblance goes, because a false
+/// sense of protection is worse than none. A server that looks past the
+/// User-Agent can tell hypertor from a browser immediately: there is no
+/// `Accept` or `Accept-Language` header, no `Sec-Fetch-*`, no second request
+/// for any subresource, no JavaScript, and the TLS ClientHello is rustls's
+/// rather than NSS's. Header *order* differs too.
+///
+/// hypertor does not try to close that gap. Faking a browser convincingly is a
+/// whole-application problem — Tor Browser solves it by controlling the entire
+/// stack — and a library that half-solved it would encourage people to rely on
+/// something that does not hold. What this default does achieve is that
+/// hypertor does not *volunteer* an identifier of its own.
+///
+/// If you are talking to an API rather than pretending to browse, setting an
+/// honest User-Agent for your application is a perfectly reasonable choice.
 ///
 /// Tor Browser is built on the Firefox Extended Support Release, and its
 /// User-Agent changes roughly once a year when a new ESR ships. If you are
@@ -27,6 +48,10 @@ pub const DEFAULT_USER_AGENT: &str =
 #[non_exhaustive]
 pub struct Config {
     /// Deadline for a whole request, including circuit setup and redirects.
+    ///
+    /// This is the outer bound: whichever of `timeout` and
+    /// [`connect_timeout`](Self::connect_timeout) elapses first ends the
+    /// request, so a `connect_timeout` larger than `timeout` can never fire.
     pub timeout: Duration,
     /// Deadline for opening one Tor stream and completing its TLS handshake.
     pub connect_timeout: Duration,
@@ -46,10 +71,24 @@ pub struct Config {
     pub user_agent: String,
     /// How redirects are handled.
     pub redirect: RedirectPolicy,
-    /// Number of times a failed request is retried on a fresh circuit.
+    /// Number of times a failed request is retried on a new connection.
     ///
     /// Only failures for which [`Error::is_retryable`](crate::Error::is_retryable)
-    /// holds are retried, and only for idempotent requests.
+    /// holds are retried, and only for idempotent requests whose body can be
+    /// produced again — a streamed body cannot be rewound, so a request
+    /// carrying one is never retried.
+    ///
+    /// # A retry is not automatically a new circuit
+    ///
+    /// The retry opens a new Tor stream, which is what recovers from a pooled
+    /// connection the peer had already closed. Whether that stream travels a
+    /// *different path* is up to [`isolation`](Self::isolation): only
+    /// [`IsolationLevel::PerRequest`] gives each attempt its own isolation
+    /// token and therefore a genuinely fresh circuit. Under the default
+    /// [`PerHost`](IsolationLevel::PerHost) the retry shares the host's
+    /// isolation group, so arti may well route it over the same circuit — which
+    /// is the right trade for the common case, since rebuilding a circuit costs
+    /// seconds and most retryable failures are not the path's fault.
     pub max_retries: u32,
     /// Whether to accept and transparently decode compressed responses.
     pub compression: bool,
@@ -60,10 +99,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Tor adds several hundred ms per hop; 30 s is generous for a
-            // request on an established circuit and tolerable for a cold one.
-            timeout: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(60),
+            // A cold request pays a circuit build (1–5 s), a TLS handshake over
+            // three hops, and the response itself. 60 s covers that with room
+            // for a slow onion service; the previous 30 s default was tighter
+            // than the 60 s connect budget nested inside it, so the connect
+            // timeout could never actually fire.
+            timeout: Duration::from_secs(60),
+            connect_timeout: Duration::from_secs(30),
             pool_max_idle_per_host: 4,
             pool_idle_timeout: Duration::from_secs(90),
             max_response_size: 16 * 1024 * 1024,
@@ -102,6 +144,17 @@ pub struct TlsConfig {
     pub min_version: TlsVersion,
     /// Offer HTTP/2 via ALPN, falling back to HTTP/1.1.
     pub alpn_h2: bool,
+    /// Allow TLS sessions to be resumed.
+    ///
+    /// Resumption saves a round trip on a repeat connection, which over three
+    /// Tor hops is worth having. hypertor gives every isolation group its own
+    /// session store, so a resumed session can only ever link requests that
+    /// were already sharing a circuit — see the [`tls`](crate::tls) module.
+    ///
+    /// Turning this off costs a full handshake every time and buys defence
+    /// against a store being partitioned less carefully than intended. It is
+    /// the right choice if you would rather pay latency than reason about it.
+    pub session_resumption: bool,
 }
 
 impl Default for TlsConfig {
@@ -113,6 +166,7 @@ impl Default for TlsConfig {
             // slice of the long tail.
             min_version: TlsVersion::Tls12,
             alpn_h2: true,
+            session_resumption: true,
         }
     }
 }
@@ -131,6 +185,12 @@ pub enum TlsVersion {
 #[derive(Debug, Clone, Default)]
 pub struct ConfigBuilder {
     config: Config,
+}
+
+impl From<Config> for ConfigBuilder {
+    fn from(config: Config) -> Self {
+        Self { config }
+    }
 }
 
 impl ConfigBuilder {
@@ -186,7 +246,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Number of retries on a fresh circuit for retryable failures.
+    /// Number of retries for retryable failures. See [`Config::max_retries`].
     pub fn max_retries(mut self, retries: u32) -> Self {
         self.config.max_retries = retries;
         self
@@ -207,6 +267,12 @@ impl ConfigBuilder {
     /// Offer HTTP/2 via ALPN for `https://` targets.
     pub fn http2(mut self, enabled: bool) -> Self {
         self.config.tls.alpn_h2 = enabled;
+        self
+    }
+
+    /// Allow TLS sessions to be resumed. See [`TlsConfig::session_resumption`].
+    pub fn tls_session_resumption(mut self, enabled: bool) -> Self {
+        self.config.tls.session_resumption = enabled;
         self
     }
 
@@ -261,6 +327,19 @@ mod tests {
         assert_eq!(c.user_agent, DEFAULT_USER_AGENT);
         // Redirects are followed by default, matching every other HTTP client.
         assert!(c.redirect.is_enabled());
+    }
+
+    #[test]
+    fn the_connect_budget_fits_inside_the_request_budget() {
+        // Otherwise the connect timeout is dead code: the whole-request timeout
+        // always fires first, and its message names the wrong operation.
+        let c = Config::default();
+        assert!(
+            c.connect_timeout <= c.timeout,
+            "connect_timeout {:?} can never fire under timeout {:?}",
+            c.connect_timeout,
+            c.timeout
+        );
     }
 
     #[test]

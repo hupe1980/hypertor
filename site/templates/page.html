@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+
+{% block body %}
+{%- set docs = get_section(path="docs/_index.md") -%}
+<div class="layout">
+
+  <aside class="sidebar" aria-label="Documentation">
+    <nav>
+      <p class="sidebar-title">Documentation</p>
+      <ul>
+        {%- for p in docs.pages %}
+        <li>
+          <a href="{{ p.permalink }}"{% if p.permalink == current_url %} aria-current="page"{% endif %}>
+            {{ p.title }}
+          </a>
+        </li>
+        {%- endfor %}
+      </ul>
+      <p class="sidebar-title">Reference</p>
+      <ul>
+        <li><a href="{{ config.extra.api_docs }}" rel="noopener">Rust API (docs.rs)</a></li>
+        <li><a href="{{ config.extra.repo }}" rel="noopener">Source</a></li>
+      </ul>
+    </nav>
+  </aside>
+
+  <main id="main" class="doc">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') }}">Home</a>
+      <span aria-hidden="true">/</span>
+      <a href="{{ docs.permalink }}">Docs</a>
+      <span aria-hidden="true">/</span>
+      <span aria-current="page">{{ page.title }}</span>
+    </nav>
+
+    <article>
+      <h1>{{ page.title }}</h1>
+      {%- if page.description %}
+      <p class="lede">{{ page.description }}</p>
+      {%- endif %}
+      {{ page.content | safe }}
+    </article>
+
+    <nav class="pager" aria-label="Pagination">
+      {%- if page.lower %}
+      <a class="pager-prev" href="{{ page.lower.permalink }}">
+        <span class="muted">Previous</span><span>{{ page.lower.title }}</span>
+      </a>
+      {%- else %}<span></span>{% endif %}
+      {%- if page.higher %}
+      <a class="pager-next" href="{{ page.higher.permalink }}">
+        <span class="muted">Next</span><span>{{ page.higher.title }}</span>
+      </a>
+      {%- endif %}
+    </nav>
+  </main>
+
+  <aside class="toc" aria-label="On this page">
+    {%- if page.toc | length > 0 %}
+    <p class="sidebar-title">On this page</p>
+    <ul>
+      {%- for h in page.toc %}
+      <li>
+        <a href="{{ h.permalink | safe }}">{{ h.title }}</a>
+        {%- if h.children | length > 0 %}
+        <ul>
+          {%- for c in h.children %}
+          <li><a href="{{ c.permalink | safe }}">{{ c.title }}</a></li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+      </li>
+      {%- endfor %}
+    </ul>
+    {%- endif %}
+    <p class="edit">
+      <a href="{{ config.extra.edit_path }}{{ page.relative_path | replace(from='content/', to='') }}" rel="noopener">Edit this page</a>
+    </p>
+  </aside>
+
+</div>
+{% endblock body %}

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{#- Neither `page` nor `section` exists here, so the title is set explicitly.
+    It has to be a block: Tera ignores top-level statements in a child. -#}
+{%- block seo -%}
+{%- set_global doc_title = "Page not found" -%}
+{%- set_global doc_desc = "That page is not part of the hypertor documentation." -%}
+{%- set_global is_article = false -%}
+{%- endblock seo -%}
+
+{% block body %}
+<main id="main" class="hero">
+  <div class="hero-inner">
+    <p class="eyebrow">404</p>
+    <h1>That page isn't here.</h1>
+    <p class="lede">
+      The documentation may have moved, or the link may have been to a page that never existed.
+    </p>
+    <div class="cta">
+      <a class="btn btn--primary" href="{{ get_url(path='@/docs/_index.md') }}">Browse the docs</a>
+      <a class="btn" href="{{ get_url(path='@/_index.md') }}">Home</a>
+    </div>
+  </div>
+</main>
+{% endblock body %}

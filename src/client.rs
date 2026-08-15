@@ -1,6 +1,7 @@
 //! The Tor HTTP client.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arti_client::config::{
@@ -27,11 +28,11 @@ use crate::tls::TlsConnector;
 ///
 /// These maps have to be bounded: a client walking a large link graph would
 /// otherwise accumulate one entry per host forever. When a map fills up it is
-/// cleared wholesale, which costs a few fresh circuits and never grows without
-/// limit.
+/// cleared wholesale, which costs a few fresh connections and never grows
+/// without limit.
 const ISOLATION_CACHE_CAPACITY: usize = 512;
 
-type PooledClient = HyperClient<TorConnector, crate::request::RequestBody>;
+type PooledClient = HyperClient<TorConnector, crate::body::Body>;
 
 /// An HTTP client that sends every request over the Tor network.
 ///
@@ -57,11 +58,11 @@ struct Inner {
     tor: Arc<arti_client::TorClient<PreferredRuntime>>,
     config: Arc<Config>,
     tls: Option<TlsConnector>,
-    /// The default pool, used when a request needs no special isolation.
-    default_pool: PooledClient,
-    /// One pool per isolation token, so isolated requests never reuse a
-    /// connection belonging to a different isolation group.
-    isolated_pools: Mutex<HashMap<IsolationToken, PooledClient>>,
+    /// The default group, used when a request needs no special isolation.
+    default_group: IsolatedGroup,
+    /// One group per isolation token, so isolated requests never reuse a
+    /// connection — or a TLS session — belonging to a different group.
+    isolated: Mutex<HashMap<IsolationToken, IsolatedGroup>>,
     /// Stable per-host tokens for [`IsolationLevel::PerHost`].
     host_tokens: Mutex<HashMap<String, IsolationToken>>,
 }
@@ -99,15 +100,15 @@ impl TorClient {
 
         let config = Arc::new(config);
 
-        let default_pool = build_pool(&tor, &tls, &config, None);
+        let default_group = IsolatedGroup::new(&tor, tls.clone(), &config, None);
 
         Ok(Self {
             inner: Arc::new(Inner {
                 tor,
                 config,
                 tls,
-                default_pool,
-                isolated_pools: Mutex::new(HashMap::new()),
+                default_group,
+                isolated: Mutex::new(HashMap::new()),
                 host_tokens: Mutex::new(HashMap::new()),
             }),
         })
@@ -123,6 +124,33 @@ impl TorClient {
         &self.inner.tor
     }
 
+    /// The TLS connector for an isolation group.
+    ///
+    /// Building one from scratch parses the whole system trust store, so the
+    /// certificate configuration is shared; what differs per group is the TLS
+    /// session-resumption store. Sharing *that* would let a server link two
+    /// requests placed on deliberately different circuits, by handing the
+    /// second a ticket the first was issued.
+    #[cfg_attr(not(feature = "ws"), allow(dead_code))]
+    pub(crate) fn tls_for(&self, isolation: Isolation) -> Option<TlsConnector> {
+        self.group_for(isolation).tls
+    }
+
+    /// Bootstrap now, rather than on the first request.
+    ///
+    /// Only meaningful for a client built with
+    /// [`lazy_bootstrap`](TorClientBuilder::lazy_bootstrap): an eagerly-built
+    /// client is already bootstrapped and this returns immediately. Calling it
+    /// lets you decide when to pay the cost — and where to handle the failure —
+    /// instead of having a user's first request absorb both.
+    pub async fn bootstrap(&self) -> Result<()> {
+        self.inner
+            .tor
+            .bootstrap()
+            .await
+            .map_err(|e| Error::bootstrap("could not bootstrap the Tor client", e))
+    }
+
     /// Resolve a hostname through Tor.
     ///
     /// The lookup is performed by an exit relay, so it never leaves your machine
@@ -134,6 +162,18 @@ impl TorClient {
             .resolve(hostname)
             .await
             .map_err(|e| Error::connect(hostname, 0, e))
+    }
+
+    /// Reverse-resolve an address through Tor.
+    ///
+    /// Like [`resolve`](Self::resolve), the lookup is performed by an exit
+    /// relay, so it never leaves your machine as a plaintext DNS query.
+    pub async fn resolve_ptr(&self, address: std::net::IpAddr) -> Result<Vec<String>> {
+        self.inner
+            .tor
+            .resolve_ptr(address)
+            .await
+            .map_err(|e| Error::connect(address.to_string(), 0, e))
     }
 
     /// Start a group of requests that share one circuit, isolated from the rest.
@@ -171,6 +211,11 @@ impl TorClient {
         self.request(Method::HEAD, url)
     }
 
+    /// Begin an `OPTIONS` request.
+    pub fn options(&self, url: &str) -> Result<RequestBuilder> {
+        self.request(Method::OPTIONS, url)
+    }
+
     /// Begin a request with an arbitrary method.
     pub fn request(&self, method: Method, url: &str) -> Result<RequestBuilder> {
         let uri: Uri = url
@@ -186,38 +231,47 @@ impl TorClient {
 
     /// The pool to use for a request.
     pub(crate) fn pool_for(&self, isolation: Isolation) -> PooledClient {
+        self.group_for(isolation).pool
+    }
+
+    /// The connection pool and TLS configuration for an isolation group.
+    fn group_for(&self, isolation: Isolation) -> IsolatedGroup {
         let token = match isolation {
-            Isolation::Shared => return self.inner.default_pool.clone(),
+            Isolation::Shared => return self.inner.default_group.clone(),
             // A single-use token will never be looked up again, so caching its
-            // pool would be pure churn — build a throwaway one and let it drop
-            // with the request.
+            // group would be pure churn — build a throwaway one and let it drop
+            // with the request. Its TLS configuration resumes nothing, since a
+            // connection used once can never benefit and a stored ticket is
+            // only something for a later connection to be correlated by.
             Isolation::SingleUse(token) => {
-                return build_pool(
-                    &self.inner.tor,
-                    &self.inner.tls,
-                    &self.inner.config,
-                    Some(token),
-                );
+                let tls = self
+                    .inner
+                    .tls
+                    .as_ref()
+                    .map(TlsConnector::without_session_resumption);
+                return IsolatedGroup::new(&self.inner.tor, tls, &self.inner.config, Some(token));
             }
             Isolation::Reusable(token) => token,
         };
 
-        let mut pools = self.inner.isolated_pools.lock();
+        let mut groups = self.inner.isolated.lock();
 
-        if pools.len() >= ISOLATION_CACHE_CAPACITY && !pools.contains_key(&token) {
+        if groups.len() >= ISOLATION_CACHE_CAPACITY && !groups.contains_key(&token) {
             debug!("clearing isolated connection pools at capacity");
-            pools.clear();
+            groups.clear();
         }
 
-        pools
+        groups
             .entry(token)
             .or_insert_with(|| {
-                build_pool(
-                    &self.inner.tor,
-                    &self.inner.tls,
-                    &self.inner.config,
-                    Some(token),
-                )
+                // A store of its own, so a resumed session can never span two
+                // isolation groups.
+                let tls = self
+                    .inner
+                    .tls
+                    .as_ref()
+                    .map(TlsConnector::with_separate_session_cache);
+                IsolatedGroup::new(&self.inner.tor, tls, &self.inner.config, Some(token))
             })
             .clone()
     }
@@ -274,6 +328,22 @@ pub(crate) enum Isolation {
     SingleUse(IsolationToken),
 }
 
+impl Isolation {
+    /// The arti token to apply, if any.
+    ///
+    /// Used by connections made outside the HTTP pool — a
+    /// [`TorWebSocket`](crate::TorWebSocket) dials arti directly but must still
+    /// honour the client-wide [`IsolationLevel`], or it would be a hole in
+    /// exactly the guarantee the setting exists to provide.
+    #[cfg_attr(not(feature = "ws"), allow(dead_code))]
+    pub(crate) fn token(self) -> Option<IsolationToken> {
+        match self {
+            Isolation::Shared => None,
+            Isolation::Reusable(token) | Isolation::SingleUse(token) => Some(token),
+        }
+    }
+}
+
 impl std::fmt::Debug for TorClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TorClient")
@@ -283,22 +353,38 @@ impl std::fmt::Debug for TorClient {
     }
 }
 
-fn build_pool(
-    tor: &Arc<arti_client::TorClient<PreferredRuntime>>,
-    tls: &Option<TlsConnector>,
-    config: &Arc<Config>,
-    isolation: Option<IsolationToken>,
-) -> PooledClient {
-    let connector = TorConnector::new(Arc::clone(tor), tls.clone(), Arc::clone(config), isolation);
+/// Everything scoped to one isolation group.
+///
+/// The connection pool and the TLS session store have to be partitioned
+/// together: separating circuits while sharing session tickets would leave the
+/// server able to link exactly the requests the circuits kept apart.
+#[derive(Clone)]
+struct IsolatedGroup {
+    pool: PooledClient,
+    tls: Option<TlsConnector>,
+}
 
-    HyperClient::builder(TokioExecutor::new())
-        .pool_idle_timeout(config.pool_idle_timeout)
-        .pool_max_idle_per_host(config.pool_max_idle_per_host)
-        // Circuits are expensive to build and cheap to keep; letting hyper
-        // retry a canceled request on a fresh connection avoids surfacing a
-        // pooled-connection race as a user-visible error.
-        .retry_canceled_requests(true)
-        .build(connector)
+impl IsolatedGroup {
+    fn new(
+        tor: &Arc<arti_client::TorClient<PreferredRuntime>>,
+        tls: Option<TlsConnector>,
+        config: &Arc<Config>,
+        isolation: Option<IsolationToken>,
+    ) -> Self {
+        let connector =
+            TorConnector::new(Arc::clone(tor), tls.clone(), Arc::clone(config), isolation);
+
+        let pool = HyperClient::builder(TokioExecutor::new())
+            .pool_idle_timeout(config.pool_idle_timeout)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            // Circuits are expensive to build and cheap to keep; letting hyper
+            // retry a canceled request on a fresh connection avoids surfacing a
+            // pooled-connection race as a user-visible error.
+            .retry_canceled_requests(true)
+            .build(connector);
+
+        Self { pool, tls }
+    }
 }
 
 /// Builds a [`TorClient`].
@@ -322,8 +408,9 @@ pub struct TorClientBuilder {
     bridges: Vec<String>,
     transports: Vec<(String, String)>,
     vanguards: Option<VanguardMode>,
-    state_dir: Option<String>,
-    cache_dir: Option<String>,
+    state_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    lazy_bootstrap: bool,
 }
 
 impl TorClientBuilder {
@@ -337,12 +424,48 @@ impl TorClientBuilder {
             vanguards: None,
             state_dir: None,
             cache_dir: None,
+            lazy_bootstrap: false,
         }
+    }
+
+    /// Replace the whole HTTP-side configuration.
+    ///
+    /// The individual setters below are shorthands for fields of [`Config`];
+    /// use this when you already have one, and note that it overwrites anything
+    /// set before it.
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = ConfigBuilder::from(config);
+        self
     }
 
     /// Deadline for a whole request, including circuit setup and redirects.
     pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
         self.config = self.config.timeout(timeout);
+        self
+    }
+
+    /// How long an idle pooled connection is kept before being closed.
+    ///
+    /// A pooled connection is a live Tor circuit. Keeping one costs almost
+    /// nothing and rebuilding it costs seconds, so the default is generous.
+    pub fn pool_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config = self.config.pool_idle_timeout(timeout);
+        self
+    }
+
+    /// Return from [`build`](Self::build) without waiting for Tor to bootstrap.
+    ///
+    /// Bootstrapping downloads a directory consensus and takes tens of seconds
+    /// on a cold cache. With this set, `build` returns at once and the first
+    /// request that needs the network waits for bootstrap instead — which is
+    /// what you want in a process that must start promptly, or that may never
+    /// make a request at all.
+    ///
+    /// The cost is moved rather than removed: the first request pays it, and
+    /// bootstrap failures surface there rather than at construction. Call
+    /// [`TorClient::bootstrap`] to pay it at a moment of your choosing.
+    pub fn lazy_bootstrap(mut self, lazy: bool) -> Self {
+        self.lazy_bootstrap = lazy;
         self
     }
 
@@ -382,9 +505,19 @@ impl TorClientBuilder {
         self
     }
 
-    /// Retries on a fresh circuit for retryable failures.
+    /// How many times a retryable failure is retried. See
+    /// [`Config::max_retries`](crate::Config::max_retries) for what a retry
+    /// does and does not give you.
     pub fn max_retries(mut self, retries: u32) -> Self {
         self.config = self.config.max_retries(retries);
+        self
+    }
+
+    /// Allow TLS sessions to be resumed. See [`TlsConfig::session_resumption`].
+    ///
+    /// [`TlsConfig::session_resumption`]: crate::TlsConfig::session_resumption
+    pub fn tls_session_resumption(mut self, enabled: bool) -> Self {
+        self.config = self.config.tls_session_resumption(enabled);
         self
     }
 
@@ -421,13 +554,16 @@ impl TorClientBuilder {
     /// Reusing a state directory preserves your guard relays across restarts,
     /// which is what Tor's guard design depends on: picking fresh guards every
     /// run multiplies your exposure to a hostile first hop.
-    pub fn state_dir(mut self, path: impl Into<String>) -> Self {
+    pub fn state_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(path.into());
         self
     }
 
     /// Where arti caches the directory consensus.
-    pub fn cache_dir(mut self, path: impl Into<String>) -> Self {
+    ///
+    /// Safe to delete: it is rebuilt on the next bootstrap, unlike
+    /// [`state_dir`](Self::state_dir), which holds keys.
+    pub fn cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(path.into());
         self
     }
@@ -486,17 +622,18 @@ impl TorClientBuilder {
 
     /// Bootstrap the client.
     pub async fn build(mut self) -> Result<TorClient> {
+        // Must happen before arti is touched: arti builds its own rustls
+        // configuration while bootstrapping, and rustls panics rather than
+        // guessing when the provider is ambiguous.
+        crate::tls::install_crypto_provider();
+
         let config = self.config.build()?;
 
         if let Some(dir) = &self.state_dir {
-            self.tor_config
-                .storage()
-                .state_dir(CfgPath::new(dir.clone()));
+            self.tor_config.storage().state_dir(cfg_path(dir));
         }
         if let Some(dir) = &self.cache_dir {
-            self.tor_config
-                .storage()
-                .cache_dir(CfgPath::new(dir.clone()));
+            self.tor_config.storage().cache_dir(cfg_path(dir));
         }
 
         for line in &self.bridges {
@@ -553,16 +690,44 @@ impl TorClientBuilder {
             .build()
             .map_err(|e| Error::config(format!("invalid Tor configuration: {e}")))?;
 
-        info!("bootstrapping Tor (the first run downloads a directory and can take a while)");
+        let runtime = PreferredRuntime::current().map_err(|e| {
+            Error::config(format!(
+                "hypertor needs to be built inside a tokio runtime: {e}"
+            ))
+        })?;
 
-        let tor = arti_client::TorClient::create_bootstrapped(tor_config)
-            .await
-            .map_err(|e| Error::bootstrap("could not bootstrap the Tor client", e))?;
+        // `OnDemand` in both cases. It is what makes the lazy path work at all,
+        // and on the eager path bootstrap has already completed by the time any
+        // request is made, so it changes nothing there.
+        let arti = arti_client::TorClient::with_runtime(runtime)
+            .config(tor_config)
+            .bootstrap_behavior(arti_client::BootstrapBehavior::OnDemand);
 
-        info!("Tor bootstrapped");
+        let tor = if self.lazy_bootstrap {
+            debug!("creating an unbootstrapped Tor client; the first request will bootstrap");
+            arti.create_unbootstrapped()
+                .map_err(|e| Error::bootstrap("could not create the Tor client", e))?
+        } else {
+            info!("bootstrapping Tor (the first run downloads a directory and can take a while)");
+            let tor = arti
+                .create_bootstrapped()
+                .await
+                .map_err(|e| Error::bootstrap("could not bootstrap the Tor client", e))?;
+            info!("Tor bootstrapped");
+            tor
+        };
 
         TorClient::from_arti(tor, config)
     }
+}
+
+/// arti wants its paths as `CfgPath`, which is built from a string.
+///
+/// A path that is not valid UTF-8 is passed through lossily rather than
+/// rejected: the alternative is refusing to start over a byte in a directory
+/// name that arti will very likely handle fine.
+fn cfg_path(path: &std::path::Path) -> CfgPath {
+    CfgPath::new(path.to_string_lossy().into_owned())
 }
 
 impl Default for TorClientBuilder {

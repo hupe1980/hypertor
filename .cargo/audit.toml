@@ -1,13 +1,30 @@
-# cargo-audit configuration
-# https://rustsec.org/
+# cargo-audit configuration — https://rustsec.org/
+#
+# This list must stay in step with the `[advisories] ignore` list in deny.toml.
+# The two tools read different files and CI runs both, so an advisory waived in
+# one and not the other fails the build for reasons nobody can find.
+#
+# Every entry says what the exposure is and why it is tolerable. An unexplained
+# ignore is how a real vulnerability gets waved through.
 
 [advisories]
-# Advisories to ignore (transitive dependencies from arti-client we cannot fix)
 ignore = [
-    # RUSTSEC-2023-0071: rsa crate - Marvin Attack timing side-channel
-    # This is a transitive dependency from arti-client (tor-llcrypto -> rsa)
-    # No fix available upstream yet. The Tor Project is aware and tracking this.
-    # Risk: Medium severity (5.9), but requires significant resources to exploit
-    # and arti uses RSA only for legacy Tor protocol compatibility.
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing side-channel in `rsa` 0.9.
+    #
+    # Reached only via arti's `ssh-key-fork-arti` -> `tor-key-forge` path, which
+    # uses it for the OpenSSH key *format* arti's key store is written in.
+    # hypertor never performs RSA decryption or signing with attacker-supplied
+    # ciphertext: onion service and client authorisation keys are ed25519 and
+    # x25519, and TLS is handled by rustls, not by this crate.
+    #
+    # There is no fixed release of `rsa` 0.9 to move to. Revisit when arti
+    # upgrades its ssh-key dependency.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0436 — `paste` is unmaintained.
+    #
+    # A maintenance-status notice, not a vulnerability: `paste` is a proc-macro
+    # that concatenates identifiers at compile time and ships no runtime code.
+    # It reaches us transitively through arti.
+    "RUSTSEC-2024-0436",
 ]

@@ -1,0 +1,77 @@
+[project]
+name = "hypertor"
+dynamic = ["version"]
+description = "Tor HTTP client and onion service library, built on arti and hyper"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "hupe1980" }]
+requires-python = ">=3.10"
+keywords = ["tor", "http", "privacy", "anonymity", "onion", "hidden-service"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://hupe1980.github.io/hypertor"
+Documentation = "https://hupe1980.github.io/hypertor"
+Repository = "https://github.com/hupe1980/hypertor"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.8",
+    "ruff>=0.2",
+]
+
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+# Cargo.toml sits beside this file and the Python package is `./hypertor`, which
+# are maturin's defaults — no `manifest-path` or `python-source` needed.
+#
+# `extension-module` is added here rather than in Cargo.toml so that a plain
+# `cargo build`/`cargo test` in the workspace links against libpython and works;
+# under that feature CPython's symbols are left for a loading interpreter to
+# supply, which is a link error anywhere outside a wheel.
+features = ["pyo3/extension-module"]
+module-name = "hypertor._hypertor"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Network tests are opt-in. Declaring the marker without deselecting it left
+# `pytest` trying to bootstrap Tor, which is neither fast nor deterministic and
+# contradicted every instruction in the docs.
+addopts = ["-m", "not network"]
+markers = [
+    "network: needs a live Tor connection; run with '-m network'",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
