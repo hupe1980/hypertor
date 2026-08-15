@@ -46,6 +46,11 @@ jobs:
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    # The offline suite runs in seconds. A job that reaches this cap is hung,
+    # not slow — every test needing the network is `#[ignore]`d — and the
+    # default six-hour limit means a hang burns runner time and reports nothing
+    # useful. One did exactly that on Windows for twenty minutes.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -232,9 +237,22 @@ jobs:
         working-directory: bindings/python
         run: maturin build --release
 
+      # `--no-index`, so this can only install the wheel just built. Without it
+      # pip may reach PyPI and resolve a *published* hypertor, and the job would
+      # be testing a release rather than the commit.
       - name: Install it
         working-directory: bindings/python
-        run: pip install --find-links ../../target/wheels hypertor
+        run: pip install --no-index --find-links ../../target/wheels hypertor
+
+      # Run from a directory that is not `bindings/python`, whose `hypertor/`
+      # source package would shadow the installed wheel. `importorskip` in the
+      # test suite turns an import failure into a skip, which surfaces only as
+      # the bare exit code 5 below — so check the import here, where a failure
+      # says what actually went wrong.
+      - name: The installed wheel imports
+        run: |
+          cd "$RUNNER_TEMP"
+          python -c "import hypertor; print(hypertor.__version__, hypertor.__file__)"
 
       # Offline by default; the `network` marker is deselected in pyproject.toml.
       - name: Test
@@ -276,7 +294,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-semver-checks
       - run: cargo semver-checks check-release --default-features
-        # 0.4.0 is a deliberate breaking release; advisory until 1.0.
+        # 0.3.0 is a deliberate breaking release; advisory until 1.0.
         continue-on-error: true
 
   package:

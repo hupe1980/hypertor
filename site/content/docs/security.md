@@ -341,7 +341,7 @@ The Tor network retires obsolete protocol versions. An outdated client is both c
 smaller, more identifiable population — and eventually non-functional. Update hypertor when it
 tracks a new arti release.
 
-hypertor 0.4 tracks **arti 0.45**.
+hypertor 0.3 tracks **arti 0.45**.
 
 ## Reporting a vulnerability
 

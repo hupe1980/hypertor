@@ -257,9 +257,12 @@ except hypertor.HypertorError:         # catches all of the above
     ...
 ```
 
-Configuration mistakes — an unknown isolation level, a malformed HTTP method — raise `ValueError`
-before any network work happens, so a typo fails immediately rather than after a minute of
-bootstrapping.
+Configuration mistakes — an unknown isolation level, a malformed HTTP method, an invalid or empty
+`OnionApp` nickname, an empty port list — raise `ValueError` before any network work happens, so a
+typo fails immediately rather than after a minute of bootstrapping. The nickname in particular is
+checked by the `OnionApp` constructor rather than by `run()`: it selects the service's key material,
+and reporting it only after every route has been registered puts the failure a long way from its
+cause.
 
 Note that `hypertor.ConnectionError` and `hypertor.TimeoutError` shadow the builtins of the same
 name inside a `from hypertor import *`; prefer the qualified form.

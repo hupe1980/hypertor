@@ -357,6 +357,10 @@ class OnionApp:
     is kept at all — the default location is persistent. Change the nickname,
     or point ``state_dir`` at a fresh directory, to get a different address.
 
+    An invalid nickname raises :class:`ValueError` from the constructor, not
+    from :meth:`run` — a bad identity should fail where it is written, not after
+    every route has been registered and a bootstrap attempted.
+
     A handler returns one of:
 
     * ``str`` — a ``200`` with ``text/plain``

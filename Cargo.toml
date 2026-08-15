@@ -6,7 +6,7 @@ members = ["bindings/python"]
 
 [package]
 name = "hypertor"
-version = "0.4.0"
+version = "0.3.0"
 edition = "2024"
 # arti 0.45 requires Rust 1.91; hypertor cannot compile on anything older, so
 # claiming a lower floor here would only produce a confusing failure deep in a

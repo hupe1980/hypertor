@@ -107,10 +107,17 @@ class TestClientSignature:
 
 
 class TestOnionApp:
-    def test_rejects_an_invalid_nickname(self):
-        app = hypertor.OnionApp("has spaces")
-        with pytest.raises(hypertor.HypertorError):
-            app.run()
+    def test_rejects_an_invalid_nickname_at_construction(self):
+        # The nickname selects the service's key material, so a bad one is
+        # rejected where it is written rather than at `run()` — after every
+        # route has been registered and a bootstrap attempted, which is a long
+        # way from the cause. `ValueError`, like the other argument checks.
+        with pytest.raises(ValueError):
+            hypertor.OnionApp("has spaces")
+
+    def test_rejects_an_empty_nickname(self):
+        with pytest.raises(ValueError):
+            hypertor.OnionApp("")
 
     def test_route_decorator_returns_the_original_function(self):
         app = hypertor.OnionApp("test-app")

@@ -221,11 +221,42 @@ fn stacked_content_encodings_are_refused_rather_than_half_decoded() {
 /// application's build, at runtime, for a reason with nothing to do with its
 /// own code.
 ///
-/// This test needs no network: it only has to get as far as building a TLS
-/// configuration, which is where the panic was.
+/// # Why this builds a *lazy* client
+///
+/// The panic being guarded against happens while building the rustls
+/// `ClientConfig`, which `TorClientBuilder::build` does on every path — see
+/// `TorClient::from_arti`. Reaching it therefore needs no network, and a lazy
+/// client reaches it without opening a single connection.
+///
+/// This test used to call `TorClient::new()` — a full eager bootstrap — under a
+/// five-second `tokio::time::timeout`, on the theory that the deadline made the
+/// network incidental. It does not. Cancelling the future does not stop the
+/// background tasks arti has already spawned, and tearing the runtime down
+/// afterwards waits on their `spawn_blocking` work, so on a runner where the
+/// directory fetch stalls the test hangs for as long as CI will let it. It hung
+/// for twenty minutes on Windows.
 #[tokio::test]
-async fn bootstrapping_does_not_panic_before_it_reaches_the_network() {
-    let _ = tokio::time::timeout(Duration::from_secs(5), TorClient::new()).await;
+async fn building_a_client_does_not_panic_on_an_ambiguous_crypto_provider() {
+    let dir = std::env::temp_dir().join("hypertor-crypto-provider-test");
+    // Never reuse the developer's real arti state: this test is about a panic
+    // at construction, and it has no business reading or writing live keys.
+    tokio::fs::remove_dir_all(&dir).await.ok();
+
+    let client = TorClient::builder()
+        .lazy_bootstrap(true)
+        .state_dir(dir.join("state"))
+        .cache_dir(dir.join("cache"))
+        .build()
+        .await
+        .expect("building a client must not panic or fail before any network use");
+
+    // Returning `Ok` at all is the assertion that matters: both branches of
+    // `build` finish in `TorClient::from_arti`, which constructs the
+    // `TlsConnector` — and therefore the rustls `ClientConfig` — and propagates
+    // its failure. Getting a client back means that ran without aborting.
+    assert!(client.config().tls.verify_certificates);
+
+    tokio::fs::remove_dir_all(&dir).await.ok();
 }
 
 // ---------------------------------------------------------------------------

@@ -5,17 +5,12 @@ All notable changes to this project are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — with the
 usual 0.x caveat that a minor bump may break.
 
-## [Unreleased]
+## [0.3.0]
 
-## [0.4.0]
-
-A deliberate hard cut from 0.2.2. 0.4 rebuilds the client on hyper's pooling
+A deliberate hard cut from 0.2.2. 0.3 rebuilds the client on hyper's pooling
 stack, moves to arti 0.45, and deletes roughly thirty modules that reimplemented
 — usually less well — things hyper and arti already do. **There is no migration
 shim**; the changes below are the migration guide.
-
-The version skips 0.3 because the surface has almost nothing in common with
-0.2.2, and a neighbouring number would have implied otherwise.
 
 ### Security
 
@@ -118,6 +113,14 @@ The version skips 0.3 because the surface has almost nothing in common with
   new connection; only `IsolationLevel::PerRequest` guarantees a different path.
 - `native-tls` returns an error for `min_tls_version(Tls13)` rather than
   silently giving you TLS 1.2.
+- **Breaking (Python): an invalid `OnionApp` nickname raises `ValueError` from
+  the constructor** rather than surfacing from `run()`. The nickname selects the
+  service's key material, and reporting it only after every route has been
+  registered — and a bootstrap attempted — puts the failure a long way from its
+  cause. This matches the Rust builder, which already validated eagerly.
+- Python handlers returning `bytes` now send
+  `Content-Type: application/octet-stream`, which the type stubs already
+  documented. Serving a body with no content type left the browser to sniff it.
 - Documentation moved to a Zola site under `site/`.
 
 ### Removed
@@ -152,5 +155,37 @@ The version skips 0.3 because the surface has almost nothing in common with
   arti's job or folded into `isolation`, `redirect` and `tls` where they are
   actually reachable and tested.
 
-[Unreleased]: https://github.com/hupe1980/hypertor/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/hupe1980/hypertor/compare/v0.2.2...v0.4.0
+### Internal
+
+Nothing here changes the published API; it is recorded because each one hid a
+real failure.
+
+- **The Python test suite ran zero tests in CI.** pytest's default `prepend`
+  import mode puts `bindings/python` on `sys.path`, and that directory holds the
+  `hypertor/` *source* package — an `__init__.py` and a `.pyi`, with no compiled
+  `_hypertor`. It shadowed the installed wheel, so `importorskip` turned the
+  resulting `ImportError` into a skip and pytest exited 5 having reported a
+  cheerful "1 skipped". It passed locally only because `maturin develop` leaves
+  a built `.so` in the source tree. Fixed with `--import-mode=importlib`, plus a
+  CI step that imports the wheel from a neutral directory so a genuine build
+  failure says what broke.
+- CI installed the bindings with `pip install --find-links`, which may still
+  reach PyPI; it is now `--no-index`, so the job cannot silently test a
+  published release instead of the commit.
+- `cargo test -p hypertor-python` now runs in CI. The bindings crate's own Rust
+  tests — covering what a handler returning a `str`, `dict`, tuple or `None`
+  becomes — existed but nothing executed them.
+- A `compile_error!` guard for a missing TLS backend is asserted in CI, so the
+  diagnostic itself is covered rather than only the failure.
+- **The offline test suite hung for twenty minutes on Windows.** One test called
+  `TorClient::new()` — a full eager bootstrap — under a five-second
+  `tokio::time::timeout`, on the theory that the deadline made the network
+  incidental. It does not: cancelling the future does not stop the background
+  tasks arti has already spawned, and tearing the runtime down afterwards waits
+  on their `spawn_blocking` work. It now builds a lazy client, which reaches the
+  same rustls `ClientConfig` construction the test is about while opening no
+  connection, and runs in 0.36 s instead of 8.5 s. The test job also carries a
+  `timeout-minutes` cap, since a job that runs long here is hung rather than
+  slow — every test needing the network is `#[ignore]`d.
+
+[0.3.0]: https://github.com/hupe1980/hypertor/compare/v0.2.2...v0.3.0

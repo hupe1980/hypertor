@@ -68,7 +68,17 @@ testpaths = ["tests"]
 # Network tests are opt-in. Declaring the marker without deselecting it left
 # `pytest` trying to bootstrap Tor, which is neither fast nor deterministic and
 # contradicted every instruction in the docs.
-addopts = ["-m", "not network"]
+#
+# `--import-mode=importlib` is not a style preference. The default `prepend`
+# mode puts this directory on `sys.path`, and this directory contains the
+# `hypertor/` *source* package — an `__init__.py` and a `.pyi`, with no compiled
+# `_hypertor` module. That shadows the installed wheel, so
+# `from hypertor._hypertor import ...` fails, `importorskip` turns the failure
+# into a skip, and pytest exits 5 ("no tests collected") having reported a
+# cheerful "1 skipped". It only passes locally because `maturin develop` leaves
+# a built `.so` in the source tree; CI installs a wheel and had every test
+# silently disappear.
+addopts = ["-m", "not network", "--import-mode=importlib"]
 markers = [
     "network: needs a live Tor connection; run with '-m network'",
 ]

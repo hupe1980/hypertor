@@ -184,9 +184,13 @@ impl PyOnionApp {
         // nickname selects the service's key material, and reporting a bad one
         // only after every route has been registered — and after a bootstrap
         // has been attempted — puts the failure a long way from its cause.
+        //
+        // `ValueError`, not `HypertorError`: this is a bad argument, and the
+        // documented rule is that configuration mistakes raise `ValueError`
+        // before any network work happens — as `ports` and `isolation` do.
         OnionServiceBuilder::new()
             .nickname(nickname)
-            .map_err(to_py_err)?;
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         Ok(Self {
             routes: Arc::new(Mutex::new(Vec::new())),
