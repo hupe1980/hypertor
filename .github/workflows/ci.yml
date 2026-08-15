@@ -273,13 +273,19 @@ jobs:
       # not see them. Run both here, where a Python interpreter is available to
       # link against — the crate does not enable `pyo3/extension-module`, so a
       # test binary links libpython and the unit tests actually run.
+      #
+      # Once, not per interpreter: the crate is built against the stable ABI and
+      # these tests exercise value conversion, neither of which varies by Python
+      # version. The wheel is what needs testing on each, and it is, above.
       - name: Clippy (bindings)
+        if: matrix.python == '3.12'
         run: cargo clippy -p hypertor-python --all-targets -- -D warnings
 
       # These cover the handler-return-value contract that the whole Python
       # `OnionApp` rests on — what a str, dict, tuple or None becomes. Nothing
       # else executes them.
       - name: Test (bindings)
+        if: matrix.python == '3.12'
         run: cargo test -p hypertor-python
 
   # ---------------------------------------------------------------------------

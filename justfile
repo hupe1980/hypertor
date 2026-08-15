@@ -18,7 +18,11 @@ fmt-check:
     cargo fmt --all -- --check
     cd bindings/python && uvx ruff format --check hypertor/ tests/ examples/
 
-# Lint
+# Lint. The bindings crate links against libpython, so it needs an interpreter
+# of 3.10 or newer — the floor its `abi3-py310` build targets. macOS resolves
+# `python3` to an Xcode stub of 3.9, which fails here; export PYO3_PYTHON (and,
+# for a relocatable standalone build such as uv's, PYTHONHOME) to point at a
+# real one.
 lint:
     cargo clippy --all-targets --features full -- -D warnings
     cargo clippy -p hypertor-python --all-targets -- -D warnings

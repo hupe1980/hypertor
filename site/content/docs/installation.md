@@ -91,8 +91,16 @@ silently runs unprotected.
 pip install hypertor
 ```
 
-Requires Python **3.10 or later**. Wheels ship for Linux, macOS and Windows on x86-64 and arm64; no
-Rust toolchain is needed to install one.
+Requires Python **3.10 or later**. Wheels ship for Linux and macOS on x86-64 and arm64, and for
+Windows on x86-64; no Rust toolchain is needed to install one.
+
+They are built against CPython's stable ABI (`abi3`), so a single wheel per platform serves every
+interpreter from 3.10 up — the same file installs on 3.10 and on 3.13. SQLite is linked statically
+into it, so arti's state store does not depend on whatever `libsqlite3` the target system has, or
+lacks.
+
+On a platform with no wheel, `pip` falls back to the source distribution and compiles arti, which
+needs a Rust toolchain and takes a while.
 
 ### Building from source
 

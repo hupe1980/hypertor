@@ -58,8 +58,9 @@ cargo add tokio --features full
 pip install hypertor
 ```
 
-Rust 1.91 or later; Python 3.10 or later. Wheels ship for Linux, macOS and Windows on x86-64 and
-arm64, so the Python package needs no Rust toolchain.
+Rust 1.91 or later; Python 3.10 or later. Wheels ship for Linux and macOS on x86-64 and arm64, and
+for Windows on x86-64, so the Python package needs no Rust toolchain. They are built against
+CPython's stable ABI, so one wheel per platform covers 3.10 onwards.
 
 ## What it does
 

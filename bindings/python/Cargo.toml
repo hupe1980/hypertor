@@ -25,10 +25,18 @@ crate-type = ["cdylib"]
 # The library, used through its public API exactly as any other consumer would.
 # Nothing here reaches into hypertor's internals; if the bindings need something
 # that is not public, that is a signal the Rust API is missing it.
+# `static-sqlite` is not a platform workaround here, it is what makes a wheel a
+# wheel: the artifact is installed by `pip` onto a machine with no Rust
+# toolchain and no say in its dependencies, so linking arti's state store
+# against whatever `libsqlite3` happens to be on that system — or is missing
+# from it, as on Windows — would turn a working build into an import error for
+# the user. The release workflow therefore passes no `--features` at all; if it
+# needed to, that would be a feature this crate does not have.
 hypertor = { path = "../..", default-features = false, features = [
     "client",
     "server",
     "rustls",
+    "static-sqlite",
 ] }
 
 # `extension-module` is added by maturin rather than declared here, so that
@@ -36,7 +44,13 @@ hypertor = { path = "../..", default-features = false, features = [
 # Under `extension-module` the CPython symbols are left for a loading
 # interpreter to supply, which is correct in a wheel and a link error anywhere
 # else — including in a test binary.
-pyo3 = { version = "0.29", optional = false }
+# `abi3-py310` builds against CPython's stable ABI, so one wheel per platform
+# covers every interpreter from 3.10 up — which is exactly what
+# `requires-python = ">=3.10"` and the classifiers promise. Without it a build
+# is tagged for the single interpreter that produced it (`cp311-cp311`), and
+# everyone on 3.10, 3.12 or 3.13 falls back to the sdist and has to compile arti
+# with a Rust toolchain they were told they would not need.
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 
 http = "1.2"

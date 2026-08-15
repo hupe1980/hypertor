@@ -177,6 +177,31 @@ real failure.
   becomes — existed but nothing executed them.
 - A `compile_error!` guard for a missing TLS backend is asserted in CI, so the
   diagnostic itself is covered rather than only the failure.
+- **The release workflow could not build anything.** It still ran maturin at the
+  repository root — where `pyproject.toml` no longer is, since the bindings moved
+  to `bindings/python` — and passed `--features "python,rustls,static-sqlite"`,
+  none of which `hypertor-python` has. The wheel jobs failed with "none of the
+  selected packages contains this feature: python" and the sdist job with
+  "Couldn't detect the binding type". Every maturin call now runs in
+  `bindings/python` and passes no `--features` at all.
+- **Wheels were built for a single interpreter.** `-i python3.11` produced
+  `cp311`-tagged wheels while `requires-python` and the classifiers promised
+  3.10 through 3.13, so everyone off 3.11 fell back to the sdist and had to
+  compile arti with a Rust toolchain the docs said they would not need.
+  `hypertor-python` now builds against CPython's stable ABI (`abi3-py310`): one
+  `cp310-abi3` wheel per platform, verified to install and import on both 3.10
+  and 3.13.
+- **Wheels no longer depend on the host's SQLite.** `static-sqlite` is pinned in
+  the bindings manifest, so arti's state store links statically rather than
+  against whatever `libsqlite3` the installing machine has — or, on Windows,
+  does not.
+- `cargo publish` now waits for the wheels and sdist to build, and runs
+  `--locked`. It previously ran in parallel with them, so a failed wheel build
+  could leave an irreversible crates.io release with no Python package beside
+  it. The tag is also checked against both manifests before anything publishes.
+- macOS x86-64 wheels are built; the documented platform list said they were and
+  the matrix did not. Windows arm64 is not built, and the docs no longer imply
+  it is.
 - **The offline test suite hung for twenty minutes on Windows.** One test called
   `TorClient::new()` — a full eager bootstrap — under a five-second
   `tokio::time::timeout`, on the theory that the deadline made the network

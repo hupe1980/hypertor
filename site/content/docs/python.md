@@ -8,7 +8,8 @@ weight = 6
 pip install hypertor
 ```
 
-Requires Python 3.10 or later. Wheels ship for Linux, macOS and Windows; no Rust toolchain needed.
+Requires Python 3.10 or later. Wheels ship for Linux and macOS on x86-64 and arm64, and for Windows
+on x86-64; no Rust toolchain needed.
 
 ## Client
 
