@@ -9,20 +9,18 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Security: Minimize information leakage in CI logs
   CARGO_INCREMENTAL: 0
 
-# Cancel in-progress runs for the same branch
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ============================================================================
-  # Code Quality
-  # ============================================================================
+  # ---------------------------------------------------------------------------
+  # Code quality
+  # ---------------------------------------------------------------------------
   fmt:
-    name: Format Check
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +30,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy Lints
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,16 +38,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Strict warnings for library code (exclude python feature - tested separately)
-      - name: Clippy (library)
-        run: cargo clippy --lib --features "client,server,http2,padding,rustls" -- -D warnings
-      # Allow unwrap() in tests/examples/benches
-      - name: Clippy (tests & examples)
-        run: cargo clippy --tests --examples --benches --features "client,server,http2,padding,rustls" -- -W clippy::unwrap_used
+      - run: cargo clippy --all-targets --features full -- -D warnings
 
-  # ============================================================================
-  # Unit Tests (all platforms)
-  # ============================================================================
+  # ---------------------------------------------------------------------------
+  # Tests
+  # ---------------------------------------------------------------------------
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
@@ -58,113 +51,104 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
-        include:
-          - os: ubuntu-latest
-            rust: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      
-      # Run tests with rustls (default) - works on all platforms without system deps
-      # Windows needs static-sqlite since SQLite isn't available as a system library
-      - name: Run tests (rustls)
-        if: matrix.os != 'windows-latest'
-        run: cargo test --features "client,server,http2,padding,rustls" --workspace
-      
-      - name: Run tests (rustls + static-sqlite)
-        if: matrix.os == 'windows-latest'
-        run: cargo test --features "client,server,http2,padding,rustls,static-sqlite" --workspace
-      
-      # On Linux/macOS, also test native-tls (requires OpenSSL)
-      - name: Run tests (native-tls)
-        if: matrix.os != 'windows-latest'
-        run: cargo test --no-default-features --features "client,server,http2,padding,native-tls" --workspace
 
-  # ============================================================================
-  # Feature Matrix Tests
-  # ============================================================================
+      # Windows has no system SQLite, which arti's state store needs.
+      - name: Test (rustls)
+        if: matrix.os != 'windows-latest'
+        run: cargo test --features full
+
+      - name: Test (rustls, static sqlite)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --features "full,static-sqlite"
+
+      # native-tls is a supported alternative and must keep working.
+      - name: Test (native-tls)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --no-default-features --features "client,server,socks,ws,native-tls"
+
+  # ---------------------------------------------------------------------------
+  # Feature combinations
+  # ---------------------------------------------------------------------------
   features:
-    name: Feature Combinations
+    name: Features (${{ matrix.features || 'default' }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         features:
-          # Default features (includes rustls + client)
           - ""
-          # Core features with default TLS (rustls)
           - "client"
           - "server"
-          - "http2"
-          - "padding"
-          # TLS backends (each enables a valid TLS stack)
-          - "rustls"
-          - "native-tls"
-          # Combinations with explicit TLS
-          - "client,server,http2,rustls"
-          - "client,server,http2,native-tls"
+          - "socks"
+          - "ws"
           - "full"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check features (${{ matrix.features || 'default' }})
-        run: cargo check --features "${{ matrix.features }}"
+      - run: cargo check --features "${{ matrix.features }}"
 
-  # ============================================================================
+  # A TLS backend is mandatory, and `server` must build without `client`.
+  features-exotic:
+    name: Features (unusual combinations)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Server only, no client
+        run: cargo check --no-default-features --features "server,rustls"
+      - name: native-tls without rustls
+        run: cargo check --no-default-features --features "client,native-tls"
+
+  # ---------------------------------------------------------------------------
   # Documentation
-  # ============================================================================
+  # ---------------------------------------------------------------------------
   docs:
-    name: Documentation
+    name: Docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Build docs
-        run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --features "client,server,http2,padding,rustls" --no-deps
+        run: cargo +nightly doc --features full --no-deps
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
 
-  # ============================================================================
-  # Security Audit
-  # ============================================================================
-  audit:
-    name: Security Audit
+  # ---------------------------------------------------------------------------
+  # MSRV
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: MSRV (1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Generate Cargo.lock
-        run: cargo generate-lockfile
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Run security audit
-        run: cargo audit --ignore RUSTSEC-2023-0071
-
-  # ============================================================================
-  # Semver Compatibility Check
-  # ============================================================================
-  semver:
-    name: Semver Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
-      - name: Check semver compatibility
-        run: cargo semver-checks check-release --default-features
-        continue-on-error: true  # Advisory for now
+      - run: cargo check --features full
 
-  # ============================================================================
-  # Dependency Ban & Advisory Check (license check removed - too volatile)
-  # ============================================================================
+  # ---------------------------------------------------------------------------
+  # Supply chain
+  # ---------------------------------------------------------------------------
+  audit:
+    name: Security advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo generate-lockfile
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
   deny:
-    name: Cargo Deny
+    name: cargo-deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,47 +156,46 @@ jobs:
         with:
           command: check bans advisories sources
 
-  # ============================================================================
-  # Code Coverage
-  # ============================================================================
+  # A privacy library must not contain unreviewed unsafe code. `forbid` in
+  # lib.rs enforces this at compile time; this asserts the attribute is present.
+  no-unsafe:
+    name: No unsafe code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify forbid(unsafe_code)
+        run: |
+          grep -q '#!\[forbid(unsafe_code)\]' src/lib.rs \
+            || { echo "src/lib.rs must keep #![forbid(unsafe_code)]"; exit 1; }
+          echo "ok"
+
+  # ---------------------------------------------------------------------------
+  # Coverage
+  # ---------------------------------------------------------------------------
   coverage:
-    name: Code Coverage
+    name: Coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate coverage
-        run: cargo llvm-cov --features "client,server,http2,padding,rustls" --workspace --lcov --output-path lcov.info
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --features full --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v4
         with:
           files: lcov.info
           fail_ci_if_error: false
 
-  # ============================================================================
-  # MSRV Check
-  # ============================================================================
-  msrv:
-    name: Minimum Supported Rust Version (1.86)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.86
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --features "client,server,http2,padding,rustls"
-
-  # ============================================================================
-  # Python Bindings
-  # ============================================================================
+  # ---------------------------------------------------------------------------
+  # Python bindings
+  # ---------------------------------------------------------------------------
   python:
-    name: Python Bindings (${{ matrix.python }})
+    name: Python ${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        python: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -220,88 +203,42 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - uses: Swatinem/rust-cache@v2
-      
-      - name: Install maturin and pytest
-        run: pip install maturin pytest
-      
-      - name: Build wheel
-        run: maturin build --features python --release
-      
-      - name: Install wheel
-        run: pip install target/wheels/*.whl
-      
-      - name: Run Python tests
-        run: pytest python/tests/ -v --tb=short
-      
-      - name: Test Python import
-        run: |
-          python -c "
-          import hypertor
-          print(f'hypertor version: {hypertor.__version__}')
-          from hypertor import Client, AsyncClient, OnionApp, AppConfig
-          print('All imports successful')
-          "
 
-  # ============================================================================
-  # Security Tests
-  # ============================================================================
-  security-tests:
-    name: Security Test Suite
+      - run: pip install maturin pytest pytest-asyncio mypy ruff
+      - run: maturin build --features python --release
+      - run: pip install --find-links target/wheels hypertor
+
+      - name: Test
+        run: pytest python/tests -v
+
+      - name: Lint
+        run: |
+          ruff check python/ python_examples/
+          ruff format --check python/ python_examples/
+
+      - name: Type-check the stubs
+        run: mypy python/hypertor
+
+  # ---------------------------------------------------------------------------
+  # Release readiness
+  # ---------------------------------------------------------------------------
+  semver:
+    name: Semver
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run security tests
-        run: cargo test --test security -- --nocapture
-      - name: Verify no unsafe code
-        run: |
-          # Search for 'unsafe' keyword in Rust files, excluding legitimate uses
-          # Uses find + grep instead of grep -r for consistent behavior across platforms
-          UNSAFE_FOUND=$(find src -name "*.rs" -exec grep -l "unsafe" {} \; | xargs grep -n "unsafe" 2>/dev/null | \
-            grep -v "forbid(unsafe_code)" | \
-            grep -v "// SAFETY:" | \
-            grep -v "#!\[" | \
-            grep -v "#\[" || true)
-          if [ -n "$UNSAFE_FOUND" ]; then
-            echo "Found unexpected unsafe code:"
-            echo "$UNSAFE_FOUND"
-            exit 1
-          fi
-          echo "✓ No unexpected unsafe code found"
-
-  # ============================================================================
-  # Benchmarks (only on main)
-  # ============================================================================
-  benchmark:
-    name: Performance Benchmarks
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run benchmarks
-        run: cargo bench --features "client,server,http2,padding,rustls" --bench benchmarks -- --noplot
-      - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          tool: 'cargo'
-          output-file-path: target/criterion/report/index.html
-          fail-on-alert: false
+      - uses: taiki-e/install-action@cargo-semver-checks
+      - run: cargo semver-checks check-release --default-features
+        # 0.3.0 is a deliberate breaking release; advisory until 1.0.
         continue-on-error: true
 
-  # ============================================================================
-  # Release Check
-  # ============================================================================
-  release-check:
-    name: Release Readiness
+  package:
+    name: Package
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check package
-        run: cargo package --allow-dirty
-      - name: Check publish (dry-run)
-        run: cargo publish --dry-run --allow-dirty
+      - run: cargo publish --dry-run

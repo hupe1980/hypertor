@@ -1,20 +1,18 @@
 [project]
 name = "hypertor"
 dynamic = ["version"]
-description = "Best-in-class Tor HTTP client and server library - consume AND host .onion services"
+description = "Tor HTTP client and onion service library, built on arti and hyper"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "hupe1980" }]
-requires-python = ">=3.9"
-keywords = ["tor", "http", "privacy", "anonymity", "onion", "hidden-service", "fastapi"]
+requires-python = ">=3.10"
+keywords = ["tor", "http", "privacy", "anonymity", "onion", "hidden-service"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -23,7 +21,6 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
     "Topic :: Security",
     "Typing :: Typed",
-    "Framework :: FastAPI",
 ]
 
 [project.urls]
@@ -50,13 +47,13 @@ module-name = "hypertor._hypertor"
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 strict = true
 
 [tool.pytest.ini_options]

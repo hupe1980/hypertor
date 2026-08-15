@@ -1,598 +1,228 @@
 ---
-title: "OnionApp"
+title: "Onion Services"
 permalink: /docs/server/
-excerpt: "Host .onion services with FastAPI-like simplicity"
+toc: true
 ---
 
-Host anonymous services on the Tor network. As simple as Flask or FastAPI, but accessible via .onion addresses.
+Hosting a `.onion` service. Requires the `server` feature:
 
-## Overview
+```toml
+hypertor = { version = "0.3", features = ["server"] }
+```
 
-`OnionApp` lets you create HTTP servers accessible only through the Tor network. When you start the app, it:
+There are two layers. `OnionService` publishes the service and hands you raw inbound streams;
+`OnionApp` puts a routed HTTP framework on top of it. Use `OnionApp` unless you are speaking a
+protocol other than HTTP.
 
-1. Generates or loads cryptographic keys
-2. Registers with the Tor network
-3. Serves requests at a `.onion` address
-
-## Basic Usage
-
-### Rust
+## An HTTP service
 
 ```rust
-use hypertor::{OnionApp, Request, Response, Result};
+use hypertor::{OnionApp, ServeResponse};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Create app
-    let app = OnionApp::new();
-    
-    // Define routes
-    app.get("/", |_req| async {
-        Response::text("Hello from the dark web!")
-    });
-    
-    app.get("/api/data", |_req| async {
-        Response::json(&serde_json::json!({
-            "message": "Secret data",
-            "timestamp": chrono::Utc::now()
-        }))
-    });
-    
-    // Start server (prints .onion address)
-    let addr = app.run().await?;
-    println!("Service running at: {}", addr);
-    
-    // Keep running
-    tokio::signal::ctrl_c().await?;
-    Ok(())
+async fn main() -> hypertor::Result<()> {
+    let app = OnionApp::new()
+        .get("/", |_req| async { ServeResponse::html("<h1>hello</h1>") })
+        .get("/health", |_req| async {
+            ServeResponse::json(&serde_json::json!({"status": "ok"}))
+        });
+
+    let service = app.serve("my-service").await?;
+    println!("live at {}", service.onion_address());
+    service.wait().await
 }
 ```
 
-### Python
+The HTTP itself is hyper's, so chunked bodies, keep-alive, pipelining and HTTP/2 behave exactly as
+they do in any other hyper server.
 
-```python
-import asyncio
-from hypertor import OnionApp
+## Keeping your address
 
-app = OnionApp()
-
-@app.get("/")
-async def index(request):
-    return {"message": "Hello from the dark web!"}
-
-@app.post("/api/echo")
-async def echo(request):
-    data = await request.json()
-    return {"received": data}
-
-async def main():
-    async with app.run() as addr:
-        print(f"Service running at: {addr}")
-        # Keep running until interrupted
-        await asyncio.Event().wait()
-
-asyncio.run(main())
-```
-
-## Configuration
+A `.onion` address is derived from a keypair. **Without a persistent state directory, arti generates
+a new keypair — and therefore a new address — on every start.**
 
 ```rust
-use hypertor::{OnionApp, SecurityLevel};
-use std::time::Duration;
+use hypertor::OnionService;
 
-let app = OnionApp::builder()
-    // Security
-    .pow_enabled(true)
-    .pow_target_bits(16)
-    .vanguards_enabled(true)
-    
-    // Performance
-    .connection_limit(100)
-    .request_timeout(Duration::from_secs(30))
-    
-    // Identity
-    .key_path("/path/to/keys")  // Persist .onion address
-    
-    // Build
-    .build();
+let service = OnionService::builder()
+    .nickname("my-service")?
+    .state_dir("/var/lib/my-service")
+    .launch()
+    .await?;
 ```
 
-### Configuration Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `pow_enabled` | false | Require proof-of-work from clients |
-| `pow_target_bits` | 20 | PoW difficulty (higher = harder) |
-| `vanguards_enabled` | true | Use Vanguards-lite for guard protection |
-| `connection_limit` | 50 | Max concurrent connections |
-| `request_timeout` | 60s | Timeout per request |
-| `key_path` | None | Path to persist keypair |
+Treat that directory as secret key material. Anyone who copies it can impersonate your service, and
+there is no revocation.
 
 ## Routing
 
 ```rust
-// Basic routes
-app.get("/", handler);
-app.post("/api/create", handler);
-app.put("/api/update", handler);
-app.delete("/api/delete", handler);
-app.patch("/api/patch", handler);
-
-// Path parameters
-app.get("/users/:id", |req| async move {
-    let id = req.param("id")?;
-    Response::json(&get_user(id).await)
-});
-
-// Multiple parameters
-app.get("/posts/:post_id/comments/:comment_id", |req| async move {
-    let post_id = req.param("post_id")?;
-    let comment_id = req.param("comment_id")?;
-    // ...
-});
+let app = OnionApp::new()
+    .get("/", handler)
+    .post("/api/items", handler)
+    .put("/api/items/{id}", handler)
+    .delete("/api/items/{id}", handler)
+    .fallback(|_req| async { ServeResponse::not_found() });
 ```
 
-## Working with Requests
+Patterns capture path segments with `{name}` (or `:name`), available through `Request::param`.
+Captured values are percent-decoded.
 
 ```rust
-use hypertor::{Request, Response};
-
-app.post("/api/data", |req: Request| async move {
-    // Headers
-    let content_type = req.header("content-type");
-    let auth = req.header("authorization");
-    
-    // Query parameters (?key=value)
-    let page = req.query("page").unwrap_or("1");
-    let limit = req.query("limit").unwrap_or("10");
-    
-    // JSON body
-    let data: MyStruct = req.json()?;
-    
-    // Form data
-    let form = req.form()?;
-    let name = form.get("name");
-    
-    // Raw body
-    let bytes = req.body();
-    
-    Response::ok()
-});
+.get("/users/{id}/posts/{post}", |req| async move {
+    let user = req.param("id").unwrap_or_default();
+    let post = req.param("post").unwrap_or_default();
+    ServeResponse::json(&serde_json::json!({ "user": user, "post": post }))
+})
 ```
 
-## Response Building
+`HEAD` requests are served by the matching `GET` route.
+
+## Requests
 
 ```rust
-use hypertor::{Response, StatusCode};
-
-// Text
-Response::text("Hello, World!")
-
-// JSON
-Response::json(&data)
-
-// With status code
-Response::with_status(StatusCode::CREATED)
-    .json(&created_resource)
-
-// With headers
-Response::json(&data)
-    .header("X-Custom", "value")
-    .header("Cache-Control", "no-store")
-
-// Redirect
-Response::redirect("/new-location")
-
-// Errors
-Response::not_found()
-Response::bad_request("Invalid input")
-Response::internal_error("Something went wrong")
+req.method();          // &Method
+req.path();            // &str, without the query string
+req.query("q");        // Option<&str>, decoded
+req.param("id");       // Option<&str>, from the route pattern
+req.headers();         // &HeaderMap
+req.body();            // &Bytes
+req.text()?;           // String
+let value: T = req.json()?;
 ```
 
-## Middleware
+Request bodies are capped at 2 MiB by default; a larger body gets a `413` instead of allocating.
 
 ```rust
-use hypertor::{OnionApp, Request, Response, Middleware};
-
-// Custom middleware
-struct LoggingMiddleware;
-
-impl Middleware for LoggingMiddleware {
-    async fn call(&self, req: Request, next: Next) -> Response {
-        let start = std::time::Instant::now();
-        let path = req.path().to_string();
-        
-        let resp = next.call(req).await;
-        
-        println!("{} {} - {:?}", 
-            resp.status(), path, start.elapsed());
-        resp
-    }
-}
-
-let app = OnionApp::new();
-app.middleware(LoggingMiddleware);
+OnionApp::new().max_body_size(16 * 1024 * 1024)
 ```
 
-### Built-in Middleware
+## Responses
 
 ```rust
-use hypertor::middleware::*;
+ServeResponse::text("plain");
+ServeResponse::html("<h1>markup</h1>");
+ServeResponse::json(&value);
+ServeResponse::not_found();
+ServeResponse::status(StatusCode::CREATED).with_body("done");
 
-// CORS
-app.middleware(Cors::permissive());
-
-// Rate limiting
-app.middleware(RateLimit::new(100, Duration::from_secs(60)));
-
-// Compression
-app.middleware(Compression::default());
-
-// Timeout
-app.middleware(Timeout::new(Duration::from_secs(30)));
+ServeResponse::text("body")
+    .with_header("Cache-Control", "no-store")
+    .with_status(StatusCode::ACCEPTED);
 ```
 
-## Persistent Identity
+Header values containing CR or LF are refused rather than written to the socket. Without that, a
+handler echoing user input into a header could split the response and inject headers of the
+attacker's choosing.
 
-By default, each restart generates a new .onion address. To keep the same address:
+## Static files
 
 ```rust
-// Save/load keys to persist identity
-let app = OnionApp::builder()
-    .key_path("/var/lib/myapp/tor_keys")
-    .build();
+OnionApp::new().static_files("./public")
 ```
 
-The key directory will contain:
-- `hs_ed25519_secret_key` — Private key (KEEP SECRET!)
-- `hs_ed25519_public_key` — Public key
-- `hostname` — Your .onion address
+Served only for `GET` and `HEAD`, and only when no route matched. Paths are rejected before touching
+the filesystem if they contain any traversal component, then canonicalised and confirmed to resolve
+inside the root — so neither `../` nor a symlink pointing outside can be used to read arbitrary
+files.
 
-## Client Authorization
+## Hardening
 
-Restrict access to specific clients:
+Every option below maps to an arti feature. hypertor implements none of this itself.
 
 ```rust
-let app = OnionApp::builder()
-    // Enable client auth
-    .client_auth_enabled(true)
-    // Add authorized clients
-    .authorized_client("descriptor:x25519:CLIENT_KEY_HERE")
-    .build();
+OnionService::builder()
+    .nickname("high-value")?
+    .state_dir("/var/lib/svc")
+    .vanguards(hypertor::VanguardMode::Full)
+    .proof_of_work(true)          // requires the `pow` feature
+    .pow_queue_depth(16_000)
+    .rate_limit_at_intro(10, 20)
+    .max_streams_per_circuit(100)
+    .num_intro_points(5)
+    .launch()
+    .await?;
 ```
 
-Only clients with the corresponding private key can connect.
+### Vanguards
 
-### Managing Authorized Clients
+Onion services keep long-lived circuits, which is exactly the condition guard-discovery attacks
+exploit: an adversary who can repeatedly cause your service to build circuits can, over time,
+identify your guard relay and from there your location. Vanguards pin the middle positions of your
+circuits to a slowly-rotating set, greatly raising that cost.
 
-```rust
-use hypertor::{OnionApp, ClientAuth};
+`VanguardMode::Full` is the strongest. Leaving it unset accepts arti's default, which already
+enables vanguards-lite where it matters.
 
-// Generate a new client key pair
-let (client_public, client_private) = ClientAuth::generate_keypair()?;
-println!("Give to client: {}", client_private.to_string());
+### Proof of work
 
-// Add to server
-let app = OnionApp::builder()
-    .client_auth_enabled(true)
-    .authorized_client(&client_public)
-    .build();
+`proof_of_work(true)` enables the Equi-X scheme from
+[Tor proposal 327](https://spec.torproject.org/hspow-spec/). It engages only when the service is
+under load, so ordinary clients pay nothing while an introduction flood becomes expensive.
 
-// Dynamic client management
-let app = OnionApp::new();
-app.add_authorized_client(&client_public).await?;
-app.remove_authorized_client(&client_public).await?;
-app.list_authorized_clients().await?;
+**Requires the `pow` feature**, which is not part of `full`: the Equi-X crates (`equix`, `hashx`)
+are LGPL-3.0-only while hypertor is MIT, so a default build stays permissively licensed.
+
+```toml
+hypertor = { version = "0.3", features = ["server", "pow"] }
 ```
 
-## Proof of Work (Anti-DDoS)
+Enabling it without the feature fails at launch rather than leaving you with a service you believe
+is protected but is not.
 
-Require clients to solve a computational puzzle before connecting:
+### Restricted discovery
+
+The strongest defence available. With clients authorised, the service descriptor is encrypted so
+that only holders of the listed keys can find the introduction points — unauthorised clients cannot
+discover the service at all, let alone connect to it.
 
 ```rust
-let app = OnionApp::builder()
-    .pow_enabled(true)
-    .pow_target_bits(20)  // Difficulty level
-    .build();
+OnionService::builder()
+    .nickname("private")?
+    .authorize_client("alice", alice_public_key)
+    .authorize_client("bob", bob_public_key)
+    .launch()
+    .await?;
 ```
 
-This makes DDoS attacks expensive while legitimate clients only pay a small one-time cost.
+Clients generate their own keypairs with `arti hsc get-key` and send you only the public half.
+**hypertor deliberately does not generate these for you:** the secret half must never exist on the
+server, and an API that produced both would invite exactly that mistake. arti supports roughly 160
+authorised clients per service.
 
-### Dynamic PoW Adjustment
+## Raw streams
 
-```rust
-use hypertor::{OnionApp, PowConfig};
-
-let app = OnionApp::builder()
-    .pow(PowConfig {
-        enabled: true,
-        base_difficulty: 16,
-        max_difficulty: 24,
-        // Auto-adjust based on load
-        auto_adjust: true,
-        target_latency: Duration::from_millis(500),
-    })
-    .build();
-```
-
-## Traffic Padding
-
-Add dummy traffic to prevent traffic analysis:
+For protocols other than HTTP:
 
 ```rust
-use hypertor::{OnionApp, PaddingConfig};
+let mut service = OnionService::builder()
+    .nickname("raw")?
+    .port(1234)
+    .launch()
+    .await?;
 
-let app = OnionApp::builder()
-    .traffic_padding(PaddingConfig {
-        enabled: true,
-        // Pad responses to multiples of this size
-        block_size: 512,
-        // Add random delay to responses
-        timing_jitter: Duration::from_millis(50),
-        // Send periodic dummy packets
-        dummy_traffic: true,
-        dummy_interval: Duration::from_secs(30),
-    })
-    .build();
-```
-
-## WebSocket Support
-
-```rust
-use hypertor::{OnionApp, WebSocket, Message};
-
-app.websocket("/ws", |ws: WebSocket| async move {
-    while let Some(msg) = ws.recv().await? {
-        match msg {
-            Message::Text(text) => {
-                ws.send(Message::Text(format!("Echo: {}", text))).await?;
-            }
-            Message::Binary(data) => {
-                ws.send(Message::Binary(data)).await?;
-            }
-            Message::Ping(data) => {
-                ws.send(Message::Pong(data)).await?;
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-    Ok(())
-});
-```
-
-## Static File Serving
-
-```rust
-use hypertor::{OnionApp, StaticFiles};
-
-// Serve directory
-app.static_files("/assets", StaticFiles::new("/path/to/assets")
-    .index_file("index.html")
-    .cache_control("max-age=3600")
-);
-
-// Single file
-app.get("/favicon.ico", StaticFiles::file("/path/to/favicon.ico"));
-```
-
-## Request Validation
-
-```rust
-use hypertor::{OnionApp, Request, Response};
-use validator::Validate;
-
-#[derive(Deserialize, Validate)]
-struct CreateUser {
-    #[validate(length(min = 3, max = 32))]
-    username: String,
-    #[validate(email)]
-    email: String,
-    #[validate(length(min = 8))]
-    password: String,
-}
-
-app.post("/users", |req: Request| async move {
-    let user: CreateUser = req.json()?;
-    
-    if let Err(errors) = user.validate() {
-        return Response::bad_request(errors.to_string());
-    }
-    
-    // Proceed with validated data
-    Response::json(&create_user(user).await?)
-});
-```
-
-## Error Handling
-
-```rust
-use hypertor::{OnionApp, Error};
-
-// Global error handler
-app.on_error(|err: Error| async move {
-    eprintln!("Error: {}", err);
-    Response::internal_error("Something went wrong")
-});
-
-// Per-route error handling
-app.get("/risky", |req| async move {
-    match do_risky_thing().await {
-        Ok(data) => Response::json(&data),
-        Err(e) => Response::bad_request(e.to_string()),
-    }
-});
-
-// Custom error types
-#[derive(Debug)]
-enum ApiError {
-    NotFound(String),
-    Validation(String),
-    Internal(String),
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        match self {
-            ApiError::NotFound(msg) => Response::not_found().json(&json!({"error": msg})),
-            ApiError::Validation(msg) => Response::bad_request().json(&json!({"error": msg})),
-            ApiError::Internal(msg) => Response::internal_error().json(&json!({"error": msg})),
-        }
-    }
+while let Some(stream) = service.accept().await {
+    tokio::spawn(async move {
+        // `stream` is AsyncRead + AsyncWrite.
+    });
 }
 ```
 
-## State Management
+## Shutdown
 
-```rust
-use std::sync::Arc;
-use tokio::sync::RwLock;
+Dropping an `OnionService` retracts it and stops publishing its descriptor. `ServingApp::shutdown`
+stops an `OnionApp`.
 
-struct AppState {
-    counter: RwLock<u64>,
-    db: Database,
-}
+Note that a descriptor already published stays in the directory for a while after shutdown, so
+clients may keep trying to reach you for several minutes.
 
-let state = Arc::new(AppState {
-    counter: RwLock::new(0),
-    db: Database::connect().await?,
-});
+## Timing
 
-let app = OnionApp::with_state(state.clone());
+| Step | Typical |
+|---|---|
+| Bootstrapping Tor | 10–60 s cold, 1–5 s warm |
+| Building introduction circuits | 5–30 s |
+| Publishing the descriptor | 10–60 s |
+| First client connection succeeding | up to ~2 minutes after launch |
 
-app.get("/count", move |req| {
-    let state = state.clone();
-    async move {
-        let mut counter = state.counter.write().await;
-        *counter += 1;
-        Response::json(&serde_json::json!({
-            "count": *counter
-        }))
-    }
-});
-```
-
-## Graceful Shutdown
-
-```rust
-use hypertor::OnionApp;
-use tokio::signal;
-
-let app = OnionApp::new();
-// ... define routes ...
-
-let server = app.run().await?;
-println!("Service running at: {}", server.onion_address());
-
-// Wait for shutdown signal
-signal::ctrl_c().await?;
-
-// Graceful shutdown with timeout
-server.shutdown(Duration::from_secs(30)).await?;
-println!("Server shut down gracefully");
-```
-
-## Health Checks
-
-```rust
-use hypertor::{OnionApp, HealthCheck};
-
-let app = OnionApp::builder()
-    .health_check(HealthCheck {
-        enabled: true,
-        path: "/health",
-        include_details: false,  // Don't leak internal info
-    })
-    .build();
-
-// Custom health check
-app.get("/health", |_| async {
-    let db_ok = check_database().await.is_ok();
-    let cache_ok = check_cache().await.is_ok();
-    
-    if db_ok && cache_ok {
-        Response::ok().json(&json!({
-            "status": "healthy",
-            "checks": {
-                "database": "ok",
-                "cache": "ok"
-            }
-        }))
-    } else {
-        Response::with_status(503).json(&json!({
-            "status": "unhealthy"
-        }))
-    }
-});
-```
-
-## Observability
-
-### Prometheus Metrics
-
-```rust
-use hypertor::{OnionApp, MetricsConfig};
-
-let app = OnionApp::builder()
-    .metrics(MetricsConfig {
-        enabled: true,
-        path: "/metrics",
-        prefix: "myservice",
-    })
-    .build();
-
-// Metrics exposed:
-// myservice_requests_total{method="GET", path="/api", status="200"}
-// myservice_request_duration_seconds{quantile="0.99"}
-// myservice_active_connections
-// myservice_pow_attempts_total
-```
-
-### Structured Logging
-
-```rust
-use hypertor::{OnionApp, LogConfig};
-
-let app = OnionApp::builder()
-    .logging(LogConfig {
-        format: LogFormat::Json,
-        level: "info",
-        // Redact sensitive data
-        redact_headers: vec!["authorization", "cookie"],
-        redact_body_fields: vec!["password", "token"],
-    })
-    .build();
-```
-
-## Multi-Service Architecture
-
-Run multiple .onion services from one application:
-
-```rust
-use hypertor::{OnionApp, ServiceConfig};
-
-// Public API service
-let public_app = OnionApp::builder()
-    .key_path("/keys/public")
-    .build();
-public_app.get("/api", public_handler);
-
-// Admin service (separate .onion address)
-let admin_app = OnionApp::builder()
-    .key_path("/keys/admin")
-    .client_auth_enabled(true)
-    .build();
-admin_app.get("/admin", admin_handler);
-
-// Run both
-tokio::try_join!(
-    public_app.run(),
-    admin_app.run(),
-)?;
-```
-
-## Next Steps
-
-- [TorClient Documentation](/docs/client/) — Make requests to .onion services
-- [Security Features](/docs/security/) — PoW, Vanguards, Leak Detection
-- [Python Bindings](/docs/python/) — Full Python API reference
+A service is not reachable the instant `launch()` returns — the descriptor still has to propagate.

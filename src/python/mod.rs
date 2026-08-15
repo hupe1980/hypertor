@@ -1,79 +1,68 @@
-//! Python bindings for hypertor
+//! Python bindings.
 //!
-//! Provides both synchronous and asynchronous Python APIs via PyO3.
-//!
-//! # Client Example
-//!
-//! ```python
-//! from hypertor import Client
-//!
-//! client = Client()
-//! response = client.get("http://example.onion")
-//! print(response.text())
-//! ```
-//!
-//! # Server Example (FastAPI-like)
-//!
-//! ```python
-//! from hypertor import OnionApp
-//!
-//! app = OnionApp()
-//!
-//! @app.get("/")
-//! def home():
-//!     return "Welcome to my onion service!"
-//!
-//! @app.post("/api/echo")
-//! def echo(request):
-//!     return {"received": request.json()}
-//!
-//! app.run()  # 🧅 Service live at: xyz...xyz.onion
-//! ```
+//! Exposes a `requests`/`httpx`-shaped client and a FastAPI-shaped onion service
+//! framework. See the `hypertor` Python package for the user-facing API.
 
-#[cfg(feature = "python")]
 mod app;
-#[cfg(feature = "python")]
 mod client;
-#[cfg(feature = "python")]
 mod response;
 
-#[cfg(feature = "python")]
-pub use client::{
-    HypertorError, TorBootstrapError, TorConnectionError, TorTimeoutError, to_py_err,
-};
+use std::sync::OnceLock;
 
-#[cfg(feature = "python")]
 use pyo3::prelude::*;
+use tokio::runtime::Runtime;
 
-/// Python module for hypertor
-#[cfg(feature = "python")]
+pub use client::{ConnectionError, HypertorError, TimeoutError, TlsError, to_py_err};
+
+/// The tokio runtime shared by every hypertor object in this interpreter.
+///
+/// One runtime, not one per client: each `Runtime` owns a thread pool, so
+/// creating one per client (as the previous bindings did) multiplied OS threads
+/// by the number of clients and prevented them from sharing anything.
+pub(crate) fn runtime() -> PyResult<&'static Runtime> {
+    static RUNTIME: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
+
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("hypertor")
+            .build()
+    }) {
+        Ok(rt) => Ok(rt),
+        Err(e) => Err(HypertorError::new_err(format!(
+            "could not start the hypertor runtime: {e}"
+        ))),
+    }
+}
+
+/// Run a future to completion, releasing the GIL while it runs.
+///
+/// Without `allow_threads`, a Tor request — which can take tens of seconds —
+/// would hold the GIL for its entire duration and freeze every other Python
+/// thread in the process.
+pub(crate) fn block_on<F, T>(py: Python<'_>, future: F) -> PyResult<T>
+where
+    F: std::future::Future<Output = PyResult<T>> + Send,
+    T: Send,
+{
+    let rt = runtime()?;
+    py.allow_threads(|| rt.block_on(future))
+}
+
 #[pymodule]
 fn _hypertor(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Add version
     m.add("__version__", crate::VERSION)?;
 
-    // Client classes
     m.add_class::<client::PyClient>()?;
     m.add_class::<client::PyAsyncClient>()?;
     m.add_class::<response::PyResponse>()?;
-
-    // Server classes (FastAPI-like)
     m.add_class::<app::PyOnionApp>()?;
-    m.add_class::<app::PyAppConfig>()?;
     m.add_class::<app::PyRequest>()?;
-    m.add_class::<app::PyAppResponse>()?;
 
-    // Exceptions
-    m.add("HypertorError", m.py().get_type::<client::HypertorError>())?;
-    m.add(
-        "TorBootstrapError",
-        m.py().get_type::<client::TorBootstrapError>(),
-    )?;
-    m.add(
-        "ConnectionError",
-        m.py().get_type::<client::TorConnectionError>(),
-    )?;
-    m.add("TimeoutError", m.py().get_type::<client::TorTimeoutError>())?;
+    m.add("HypertorError", m.py().get_type::<HypertorError>())?;
+    m.add("ConnectionError", m.py().get_type::<ConnectionError>())?;
+    m.add("TimeoutError", m.py().get_type::<TimeoutError>())?;
+    m.add("TlsError", m.py().get_type::<TlsError>())?;
 
     Ok(())
 }

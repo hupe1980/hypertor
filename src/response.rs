@@ -1,29 +1,23 @@
-//! HTTP Response wrapper
-//!
-//! Provides a convenient interface for working with HTTP responses,
-//! including streaming body consumption, compression, and encoding detection.
+//! HTTP responses.
 
-use bytes::Bytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::{HeaderMap, StatusCode, Version};
 use http_body_util::BodyExt;
 
-use crate::compression::{Compression, decompress};
+use crate::body::{self, Encoding};
 use crate::error::{Error, Result};
 
-/// HTTP Response
+/// A completed HTTP response with its body already read.
+#[derive(Clone)]
 pub struct Response {
-    /// HTTP status code
     status: StatusCode,
-    /// HTTP version
     version: Version,
-    /// Response headers
     headers: HeaderMap,
-    /// Response body (collected and decompressed)
     body: Bytes,
 }
 
 impl Response {
-    /// Create a new response from parts
+    /// Assemble a response from parts. Mostly useful in tests.
     pub fn new(status: StatusCode, version: Version, headers: HeaderMap, body: Bytes) -> Self {
         Self {
             status,
@@ -33,54 +27,56 @@ impl Response {
         }
     }
 
-    /// Create a response from a hyper response with automatic decompression
-    pub async fn from_hyper<B>(response: http::Response<B>, max_size: usize) -> Result<Self>
+    /// Read a hyper response, enforcing `limit` **as the body streams in**.
+    ///
+    /// The limit is checked per frame rather than after collecting, so a
+    /// malicious or misconfigured server cannot make the client allocate an
+    /// unbounded buffer before the check runs. It is applied a second time to
+    /// the decompressed size, which is what bounds decompression bombs.
+    pub(crate) async fn read<B>(response: http::Response<B>, limit: usize) -> Result<Self>
     where
-        B: http_body::Body,
+        B: http_body::Body + Unpin,
+        B::Data: Buf,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        let (parts, body) = response.into_parts();
+        let (parts, mut body) = response.into_parts();
 
-        // Collect body with size limit
-        let collected = body
-            .collect()
-            .await
-            .map_err(|e| Error::http_with_source("failed to read response body", e))?;
-
-        let raw_bytes = collected.to_bytes();
-
-        if raw_bytes.len() > max_size {
-            return Err(Error::ResponseTooLarge {
-                size: raw_bytes.len(),
-                limit: max_size,
+        // If the server declares an oversized body, refuse before reading it.
+        if let Some(declared) = parts
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            && declared > limit
+        {
+            return Err(Error::BodyTooLarge {
+                size: declared,
+                limit,
             });
         }
 
-        // Detect and decompress if needed
-        let content_encoding = parts
-            .headers
-            .get(http::header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok());
+        let mut buf = BytesMut::new();
 
-        let compression = content_encoding
-            .map(Compression::from_header)
-            .unwrap_or(Compression::None);
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| Error::http_source("could not read response body", e))?;
 
-        let body = if compression != Compression::None {
-            let decompressed = decompress(&raw_bytes, compression)?;
-
-            // Check decompressed size too (compression bombs)
-            if decompressed.len() > max_size * 10 {
-                return Err(Error::ResponseTooLarge {
-                    size: decompressed.len(),
-                    limit: max_size * 10,
-                });
+            if let Ok(data) = frame.into_data() {
+                let len = Buf::remaining(&data);
+                if buf.len() + len > limit {
+                    return Err(Error::BodyTooLarge {
+                        size: buf.len() + len,
+                        limit,
+                    });
+                }
+                // `put` walks every chunk, so non-contiguous buffers are copied
+                // in full rather than truncated to their first chunk.
+                BufMut::put(&mut buf, data);
             }
+        }
 
-            Bytes::from(decompressed)
-        } else {
-            raw_bytes
-        };
+        let raw = buf.freeze();
+        let encoding = Encoding::from_headers(&parts.headers)?;
+        let body = body::decode(&raw, encoding, limit)?;
 
         Ok(Self {
             status: parts.status,
@@ -90,114 +86,115 @@ impl Response {
         })
     }
 
-    /// Get the HTTP status code
+    /// The status code.
     pub fn status(&self) -> StatusCode {
         self.status
     }
 
-    /// Get the HTTP status code as a u16
-    pub fn status_code(&self) -> u16 {
-        self.status.as_u16()
-    }
-
-    /// Check if the response status is success (2xx)
-    pub fn is_success(&self) -> bool {
-        self.status.is_success()
-    }
-
-    /// Check if the response status is a redirect (3xx)
-    pub fn is_redirect(&self) -> bool {
-        self.status.is_redirection()
-    }
-
-    /// Check if the response status is a client error (4xx)
-    pub fn is_client_error(&self) -> bool {
-        self.status.is_client_error()
-    }
-
-    /// Check if the response status is a server error (5xx)
-    pub fn is_server_error(&self) -> bool {
-        self.status.is_server_error()
-    }
-
-    /// Get the HTTP version
+    /// The HTTP version the response was received over.
     pub fn version(&self) -> Version {
         self.version
     }
 
-    /// Get the response headers
+    /// The response headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
-    /// Get a specific header value
+    /// A single header value, if present and valid ASCII.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 
-    /// Get the Content-Type header
+    /// The `Content-Type` header.
     pub fn content_type(&self) -> Option<&str> {
         self.header("content-type")
     }
 
-    /// Get the Content-Length header
-    pub fn content_length(&self) -> Option<usize> {
-        self.header("content-length").and_then(|v| v.parse().ok())
+    /// Whether the status is 2xx.
+    pub fn is_success(&self) -> bool {
+        self.status.is_success()
     }
 
-    /// Get the response body as bytes
+    /// Return an error if the status is not 2xx.
+    ///
+    /// ```rust,no_run
+    /// # async fn demo(client: &hypertor::TorClient) -> hypertor::Result<()> {
+    /// let body = client.get("http://api.onion/v1")?
+    ///     .send()
+    ///     .await?
+    ///     .error_for_status()?
+    ///     .text()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn error_for_status(self) -> Result<Self> {
+        if self.status.is_success() {
+            Ok(self)
+        } else {
+            Err(Error::Http {
+                message: format!(
+                    "server returned {} {}",
+                    self.status.as_u16(),
+                    self.status.canonical_reason().unwrap_or("")
+                ),
+                source: None,
+            })
+        }
+    }
+
+    /// The decoded body.
     pub fn bytes(&self) -> &Bytes {
         &self.body
     }
 
-    /// Consume the response and return the body bytes
+    /// Consume the response, returning the decoded body.
     pub fn into_bytes(self) -> Bytes {
         self.body
     }
 
-    /// Get the response body as text
+    /// The body as UTF-8 text.
     ///
-    /// Uses the charset from Content-Type header, defaulting to UTF-8.
-    /// Currently supports UTF-8 only; other charsets are attempted as UTF-8.
+    /// hypertor does not transcode other charsets. A response declaring, say,
+    /// `charset=shift_jis` will fail here rather than silently producing
+    /// mojibake; decode it yourself from [`bytes`](Self::bytes) if you need to.
     pub fn text(&self) -> Result<String> {
-        // Parse charset from Content-Type if available
-        // e.g., "text/html; charset=utf-8" or "application/json; charset=UTF-8"
-        let _charset = self
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|ct| ct.to_str().ok())
-            .and_then(|ct| {
-                ct.split(';')
-                    .filter_map(|part| {
-                        let part = part.trim();
-                        if part.to_lowercase().starts_with("charset=") {
-                            Some(part[8..].trim_matches('"').to_lowercase())
-                        } else {
-                            None
-                        }
+        std::str::from_utf8(&self.body)
+            .map(str::to_owned)
+            .map_err(|e| {
+                let charset = self
+                    .content_type()
+                    .and_then(|ct| {
+                        ct.split(';').find_map(|p| {
+                            let p = p.trim();
+                            p.strip_prefix("charset=")
+                                .or_else(|| p.strip_prefix("charset ="))
+                        })
                     })
-                    .next()
+                    .map(|c| c.trim_matches('"').to_ascii_lowercase());
+
+                match charset {
+                    Some(c) if c != "utf-8" && c != "us-ascii" => Error::decode(format!(
+                        "response body is {c}-encoded; hypertor only decodes UTF-8, \
+                         use `bytes()` and transcode it yourself"
+                    )),
+                    _ => Error::decode(format!("response body is not valid UTF-8: {e}")),
+                }
             })
-            .unwrap_or_else(|| "utf-8".to_string());
-
-        // Currently only UTF-8 is fully supported
-        // Other charsets would require encoding_rs crate
-        String::from_utf8(self.body.to_vec())
-            .map_err(|e| Error::http(format!("response is not valid UTF-8: {}", e)))
     }
 
-    /// Consume the response and return the body as text
-    pub fn into_text(self) -> Result<String> {
-        String::from_utf8(self.body.to_vec())
-            .map_err(|e| Error::http(format!("response is not valid UTF-8: {}", e)))
+    /// Deserialise the body as JSON.
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body)
+            .map_err(|e| Error::decode(format!("response body is not valid JSON: {e}")))
     }
 
-    /// Get the length of the response body
+    /// The decoded body length in bytes.
     pub fn len(&self) -> usize {
         self.body.len()
     }
 
-    /// Check if the response body is empty
+    /// Whether the decoded body is empty.
     pub fn is_empty(&self) -> bool {
         self.body.is_empty()
     }
@@ -208,37 +205,110 @@ impl std::fmt::Debug for Response {
         f.debug_struct("Response")
             .field("status", &self.status)
             .field("version", &self.version)
-            .field("headers", &self.headers)
             .field("body_len", &self.body.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use http_body_util::Full;
+
+    fn response_with(headers: Vec<(&str, &str)>, body: &[u8]) -> http::Response<Full<Bytes>> {
+        let mut builder = http::Response::builder().status(200);
+        for (k, v) in headers {
+            builder = builder.header(k, v);
+        }
+        builder
+            .body(Full::new(Bytes::copy_from_slice(body)))
+            .expect("valid response")
+    }
+
+    #[tokio::test]
+    async fn reads_a_plain_body() {
+        let resp = Response::read(response_with(vec![], b"hello"), 1024)
+            .await
+            .expect("reads");
+        assert_eq!(resp.text().unwrap(), "hello");
+        assert!(resp.is_success());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_declared_oversized_body_before_reading() {
+        let err = Response::read(
+            response_with(vec![("content-length", "999999")], b"x"),
+            1024,
+        )
+        .await
+        .expect_err("must reject");
+
+        assert!(matches!(
+            err,
+            Error::BodyTooLarge {
+                size: 999999,
+                limit: 1024
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn enforces_the_limit_on_an_undeclared_body() {
+        // No Content-Length, so the limit must be caught while streaming.
+        let err = Response::read(response_with(vec![], &vec![b'x'; 4096]), 1024)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, Error::BodyTooLarge { limit: 1024, .. }));
+    }
+
+    #[tokio::test]
+    async fn decompresses_gzip_responses() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"compressed over tor").unwrap();
+        let gz = enc.finish().unwrap();
+
+        let resp = Response::read(response_with(vec![("content-encoding", "gzip")], &gz), 1024)
+            .await
+            .expect("reads");
+        assert_eq!(resp.text().unwrap(), "compressed over tor");
+    }
+
+    #[tokio::test]
+    async fn parses_json() {
+        let resp = Response::read(response_with(vec![], br#"{"ip":"1.2.3.4"}"#), 1024)
+            .await
+            .expect("reads");
+        let value: serde_json::Value = resp.json().unwrap();
+        assert_eq!(value["ip"], "1.2.3.4");
+    }
 
     #[test]
-    fn test_response_status() {
+    fn error_for_status_rejects_non_2xx() {
         let resp = Response::new(
-            StatusCode::OK,
+            StatusCode::NOT_FOUND,
             Version::HTTP_11,
             HeaderMap::new(),
             Bytes::new(),
         );
-        assert!(resp.is_success());
-        assert_eq!(resp.status_code(), 200);
+        assert!(resp.error_for_status().is_err());
     }
 
     #[test]
-    fn test_response_text() {
+    fn non_utf8_text_names_the_charset() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "text/html; charset=shift_jis".parse().unwrap(),
+        );
         let resp = Response::new(
             StatusCode::OK,
             Version::HTTP_11,
-            HeaderMap::new(),
-            Bytes::from("Hello, World!"),
+            headers,
+            Bytes::from_static(&[0x82, 0xA0]),
         );
-        assert_eq!(resp.text().unwrap(), "Hello, World!");
+
+        let err = resp.text().expect_err("not utf-8");
+        assert!(err.to_string().contains("shift_jis"), "got: {err}");
     }
 }

@@ -1,8 +1,8 @@
 # hypertor Documentation Site
 
 title: hypertor
-description: "The Tor network library for Rust and Python — consume AND host onion services"
-url: "https://nicoburniske.github.io"
+description: "Tor for Rust and Python — HTTP over Tor, and hosting onion services"
+url: "https://hupe1980.github.io"
 baseurl: "/hypertor"
 
 # Build settings
@@ -73,7 +73,7 @@ footer:
   links:
     - label: "GitHub"
       icon: "fab fa-fw fa-github"
-      url: "https://github.com/nicoburniske/hypertor"
+      url: "https://github.com/hupe1980/hypertor"
 
 # Analytics (optional)
 # analytics:

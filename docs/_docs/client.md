@@ -1,461 +1,232 @@
 ---
-title: "TorClient"
+title: "Client"
 permalink: /docs/client/
-excerpt: "HTTP client for the Tor network"
+toc: true
 ---
 
-HTTP client for the Tor network. As simple as `reqwest`, but routes everything through Tor.
+`TorClient` sends HTTP requests over Tor. The API deliberately mirrors `reqwest`, so most of what
+you already know transfers.
 
-## Overview
-
-`TorClient` is a high-level HTTP client that connects to the Tor network and routes all requests through onion circuits. It provides:
-
-- **Simple API** — Familiar request/response pattern
-- **Connection pooling** — Reuse circuits for performance
-- **Circuit isolation** — Separate identities per request or session
-- **Resilience** — Retry, circuit breaker, backpressure
-- **Observability** — Prometheus metrics, tracing
-
-## Basic Usage
-
-### Rust
+## Creating a client
 
 ```rust
-use hypertor::{TorClient, Result};
+use hypertor::TorClient;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Create client (connects to Tor network)
-    let client = TorClient::new().await?;
-    
-    // GET request
-    let resp = client.get("http://example.onion")?
-        .send().await?;
-    println!("Status: {}", resp.status());
-    
-    // POST with JSON
-    let resp = client.post("http://api.onion/data")?
-        .json(&serde_json::json!({"key": "value"}))
-        .send().await?;
-    
-    // Read response
-    let body: serde_json::Value = resp.json()?;
-    println!("{:?}", body);
-    
-    Ok(())
-}
+// Defaults
+let client = TorClient::new().await?;
 ```
-
-### Python
-
-```python
-import asyncio
-from hypertor import AsyncClient, TimeoutError, HypertorError
-
-async def main():
-    async with AsyncClient(timeout=60) as client:
-        # GET request
-        resp = await client.get("https://check.torproject.org/api/ip")
-        print(f"Status: {resp.status_code}")
-        print(f"Tor IP: {resp.json().get('IP')}")
-        
-        # POST with JSON
-        resp = await client.post(
-            "https://httpbin.org/post",
-            json='{"key": "value"}'
-        )
-        
-        # Read response
-        body = resp.json()
-        print(body)
-
-asyncio.run(main())
-```
-
-## Configuration
-
-Use the builder pattern for advanced configuration:
 
 ```rust
-use hypertor::{TorClient, IsolationLevel};
 use std::time::Duration;
+use hypertor::{IsolationLevel, RedirectPolicy, TorClient};
 
 let client = TorClient::builder()
-    // Timeouts
-    .timeout(Duration::from_secs(30))
-    
-    // Circuit isolation (separate identity per request)
-    .isolation(IsolationLevel::PerRequest)
-    
-    // Connection pooling
-    .max_connections(20)
-    
-    // Follow redirects
-    .follow_redirects(true)
-    .max_redirects(5)
-    
-    // Build
+    .timeout(Duration::from_secs(60))
+    .connect_timeout(Duration::from_secs(90))
+    .isolation(IsolationLevel::PerHost)
+    .redirect(RedirectPolicy::limited(5))
+    .max_retries(2)
+    .user_agent("my-app/1.0")
     .build()
     .await?;
 ```
 
-### Configuration Options
+Bootstrapping is expensive. **Create one client and reuse it** — cloning is cheap and shares the
+underlying Tor instance, circuits and connection pool.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `timeout` | 30s | Request timeout |
-| `isolation` | `None` | Circuit isolation level |
-| `max_connections` | 10 | Max pooled connections |
-| `follow_redirects` | false | Follow HTTP redirects |
-| `max_redirects` | 5 | Max redirects to follow |
-| `verify_tls` | true | Verify TLS certificates |
+### Defaults
 
-## Circuit Isolation
+| Setting | Default | Notes |
+|---|---|---|
+| `timeout` | 30 s | Covers the whole request, including redirects |
+| `connect_timeout` | 60 s | One circuit build plus TLS handshake |
+| `isolation` | `PerHost` | Different destinations never share a circuit |
+| `redirect` | follow up to 10 | Credentials stripped across origins |
+| `max_retries` | 2 | Idempotent methods only |
+| `max_response_size` | 16 MiB | Enforced while streaming |
+| `compression` | on | gzip, brotli, zstd, deflate |
+| `user_agent` | Tor Browser's | Blends into the largest anonymity set |
 
-Circuit isolation determines how Tor circuits are shared between requests. This is crucial for both **performance** (circuit reuse) and **privacy** (traffic separation).
-
-| Level | Behavior | Use Case |
-|-------|----------|----------|
-| `None` | All requests share circuits | Maximum performance, same identity |
-| `PerSession` | Circuits per session/client | Default, good balance |
-| `PerRequest` | Fresh circuit per request | Maximum privacy, slower |
-| `PerHost` | Circuits per destination | Multi-service access |
+## Making requests
 
 ```rust
-use hypertor::{TorClient, IsolationLevel, IsolationToken};
+// Methods
+client.get(url)?;
+client.post(url)?;
+client.put(url)?;
+client.patch(url)?;
+client.delete(url)?;
+client.head(url)?;
+client.request(Method::OPTIONS, url)?;
 
-// Per-request isolation (different IP each time)
-let client = TorClient::builder()
-    .isolation(IsolationLevel::PerRequest)
-    .build().await?;
+// Bodies
+client.post(url)?.json(&value).send().await?;
+client.post(url)?.form([("key", "value")]).send().await?;
+client.post(url)?.text("plain text").send().await?;
+client.post(url)?.body(bytes).send().await?;
 
-// Custom isolation token (group related requests)
-let token = IsolationToken::new();
-let resp = client.get("http://example.onion")?
-    .isolation(token.clone())
-    .send().await?;
+// Query parameters, percent-encoded for you
+client.get(url)?.query([("q", "rust & tor")]).send().await?;
+
+// Headers and auth
+client.get(url)?
+    .header("X-Custom", "value")
+    .bearer_auth(token)
+    .send()
+    .await?;
 ```
 
-## HTTP Methods
+Credential headers set by `basic_auth` and `bearer_auth` are marked sensitive, which keeps them out
+of HTTP/2's shared header-compression table where they would otherwise be a cross-request oracle.
+
+## Responses
 
 ```rust
-// GET
-let resp = client.get("http://example.onion")?.send().await?;
+let response = client.get(url)?.send().await?;
 
-// POST with JSON
-let resp = client.post("http://example.onion/api")?
-    .json(&data)
-    .send().await?;
+response.status();          // StatusCode
+response.is_success();      // 2xx?
+response.headers();         // &HeaderMap
+response.header("etag");    // Option<&str>
 
-// POST with form data
-let resp = client.post("http://example.onion/form")?
-    .form(&[("key", "value")])?
-    .send().await?;
+response.text()?;           // String (UTF-8 only)
+response.bytes();           // &Bytes
+let user: User = response.json()?;
 
-// PUT
-let resp = client.put("http://example.onion/resource")?
-    .body("data")
-    .send().await?;
-
-// DELETE
-let resp = client.delete("http://example.onion/resource")?
-    .send().await?;
-
-// HEAD
-let resp = client.head("http://example.onion")?.send().await?;
-
-// PATCH
-let resp = client.patch("http://example.onion/resource")?
-    .json(&partial_update)
-    .send().await?;
+// Turn a non-2xx status into an error
+let response = client.get(url)?.send().await?.error_for_status()?;
 ```
 
-## Query Parameters
+`text()` decodes UTF-8 only. A response declaring another charset produces an error naming that
+charset, rather than silently returning mojibake — use `bytes()` and transcode it yourself.
+
+## Circuit isolation
+
+Two requests on the same circuit exit Tor from the same relay at the same moment, and are linkable
+by anyone watching it. Isolation is how you decide which of your activities may be linked.
 
 ```rust
-// Add query parameters
-let resp = client.get("http://example.onion/search")?
-    .query(&[("q", "rust"), ("page", "1")])  // ?q=rust&page=1
-    .send().await?;
+use hypertor::IsolationToken;
 
-// Multiple values for same key
-let resp = client.get("http://example.onion/filter")?
-    .query(&[("tag", "security"), ("tag", "tor"), ("tag", "rust")])
-    .send().await?;
+let alice = IsolationToken::new();
+let bob = IsolationToken::new();
 
-// With structs (requires serde)
-#[derive(Serialize)]
-struct SearchParams {
-    q: String,
-    page: u32,
-    limit: u32,
-}
+// Same token → same circuit.
+client.get("http://forum.onion/inbox")?.isolation(alice).send().await?;
+client.get("http://forum.onion/profile")?.isolation(alice).send().await?;
 
-let params = SearchParams { q: "tor".into(), page: 1, limit: 50 };
-let resp = client.get("http://example.onion/search")?
-    .query(&params)
-    .send().await?;
+// Different token → guaranteed different circuit.
+client.get("http://shop.onion/cart")?.isolation(bob).send().await?;
 ```
 
-## Request Headers
+| Level | Behaviour | Cost |
+|---|---|---|
+| `None` | hypertor adds no isolation of its own | Cheapest |
+| `PerHost` *(default)* | One circuit family per destination host | Reuses warm circuits |
+| `PerRequest` | A fresh circuit for every request | Seconds per request |
+| `Fixed(token)` | One explicit token for everything | — |
+
+`PerRequest` makes connection reuse impossible by construction, so every request pays the full
+circuit build. Use it when unlinkability matters more than latency.
+
+Each isolation group gets its own connection pool, so an isolated request can never be handed a
+connection belonging to another group.
+
+## Redirects
+
+A redirect is the server choosing your next request, which needs more care over Tor than elsewhere.
 
 ```rust
-// Set individual headers
-let resp = client.get("http://example.onion")?
-    .header("X-Custom-Header", "value")
-    .header("Accept", "application/json")
-    .send().await?;
+use hypertor::RedirectPolicy;
 
-// Set multiple headers
-use hypertor::HeaderMap;
-
-let mut headers = HeaderMap::new();
-headers.insert("X-API-Key", "secret-key".parse()?);
-headers.insert("X-Request-ID", uuid::Uuid::new_v4().to_string().parse()?);
-
-let resp = client.get("http://example.onion")?
-    .headers(headers)
-    .send().await?;
+RedirectPolicy::default();              // follow up to 10
+RedirectPolicy::limited(3);
+RedirectPolicy::none();                 // return the 3xx as-is
+RedirectPolicy::default().allow_onion_to_clearnet(true);
 ```
 
-## Working with Responses
+By default hypertor:
+
+- **strips `Authorization`, `Proxy-Authorization` and `Cookie`** whenever the origin changes, so a
+  redirect cannot replay your credentials to a host you never chose to trust;
+- **refuses a redirect from a `.onion` out to clearnet**, which would move your traffic from an
+  end-to-end encrypted onion connection onto a path through an untrusted exit relay;
+- rewrites `POST` to `GET` on 301, 302 and 303, and preserves the method on 307 and 308.
+
+Moving *into* the Tor network — clearnet redirecting to `.onion` — is always allowed, since it is an
+upgrade rather than a downgrade.
+
+## Retries
+
+Failed requests are retried on a **fresh circuit**, which is the entire reason retrying is worth
+doing: Tor picks a different path each time, so a bad relay is routed around rather than hit again.
+
+Only idempotent methods are retried (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) and only
+for transient failures. A `POST` is never retried automatically — that could charge a card twice.
 
 ```rust
-let resp = client.get("http://example.onion")?.send().await?;
-
-// Status
-let status = resp.status();  // u16
-let is_ok = resp.status().is_success();  // 2xx
-
-// Headers
-let content_type = resp.headers().get("content-type");
-
-// Body as text
-let text = resp.text()?;
-
-// Body as JSON
-let data: MyStruct = resp.json()?;
-
-// Body as bytes
-let bytes = resp.bytes()?;
-
-// Streaming large responses
-let mut stream = resp.bytes_stream();
-while let Some(chunk) = stream.next().await {
-    let chunk = chunk?;
-    process_chunk(&chunk)?;
-}
+let client = TorClient::builder().max_retries(3).build().await?;
 ```
 
-## Authentication
+## Connection pooling
+
+The Tor connector plugs into hyper's pooling client, so a warm circuit is reused across requests.
 
 ```rust
-// Basic auth
-let resp = client.get("http://example.onion")?
-    .basic_auth("username", "password")
-    .send().await?;
-
-// Bearer token
-let resp = client.get("http://example.onion")?
-    .bearer_auth("my-token")
-    .send().await?;
-
-// Custom authentication header
-let resp = client.get("http://example.onion")?
-    .header("X-API-Key", "your-api-key")
-    .send().await?;
+client.get(url)?.send().await?;  // builds a circuit — seconds
+client.get(url)?.send().await?;  // reuses it — hundreds of milliseconds
 ```
 
-## Resilience & Retries
-
-HyperTor includes built-in resilience features:
-
 ```rust
-use hypertor::{TorClient, RetryConfig, CircuitBreakerConfig};
-use std::time::Duration;
-
-let client = TorClient::builder()
-    // Retry failed requests
-    .retry(RetryConfig {
-        max_retries: 3,
-        initial_delay: Duration::from_millis(100),
-        max_delay: Duration::from_secs(5),
-        exponential_backoff: true,
-        retry_on: vec![500, 502, 503, 504],
-    })
-    // Circuit breaker (prevent cascade failures)
-    .circuit_breaker(CircuitBreakerConfig {
-        failure_threshold: 5,
-        success_threshold: 2,
-        timeout: Duration::from_secs(30),
-    })
-    .build().await?;
+TorClient::builder()
+    .pool_max_idle_per_host(8)
+    .build()
+    .await?;
 ```
 
-## Backpressure & Rate Limiting
+## HTTP/2
 
-Protect onion services from being overwhelmed:
+Negotiated by ALPN on `https://` targets and used automatically when the server supports it, which
+lets several concurrent requests share one circuit. Turn it off with `.http2(false)`.
 
-```rust
-use hypertor::{TorClient, RateLimitConfig};
-use std::time::Duration;
+HTTP/2 is not attempted on plain `http://`, including `.onion` URLs, because that would require
+prior knowledge that the server speaks it.
 
-let client = TorClient::builder()
-    // Client-side rate limiting
-    .rate_limit(RateLimitConfig {
-        requests_per_second: 10,
-        burst_size: 20,
-    })
-    // Concurrent request limit
-    .max_concurrent_requests(5)
-    // Backpressure (wait when overwhelmed)
-    .backpressure_strategy(BackpressureStrategy::Wait)
-    .build().await?;
-```
-
-## Circuit Management
-
-Control Tor circuits directly for advanced use cases:
+## Errors
 
 ```rust
-use hypertor::TorClient;
+use hypertor::Error;
 
-let client = TorClient::new().await?;
-
-// Get current circuit information
-let circuit = client.circuit_info().await?;
-println!("Circuit ID: {}", circuit.id);
-println!("Path: {:?}", circuit.path);
-println!("Guard: {}", circuit.guard);
-println!("Exit: {}", circuit.exit);
-
-// Force new circuit (new IP address)
-client.new_circuit().await?;
-
-// Get multiple circuits for load balancing
-let circuits = client.circuits(5).await?;
-```
-
-## Observability
-
-### Prometheus Metrics
-
-```rust
-use hypertor::{TorClient, MetricsConfig};
-
-let client = TorClient::builder()
-    .metrics(MetricsConfig {
-        enabled: true,
-        prefix: "hypertor",
-        histogram_buckets: vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
-    })
-    .build().await?;
-
-// Metrics are automatically exported
-// hypertor_requests_total{method="GET", status="200"}
-// hypertor_request_duration_seconds{method="GET", quantile="0.99"}
-// hypertor_circuit_build_time_seconds
-// hypertor_active_connections
-```
-
-### OpenTelemetry Tracing
-
-```rust
-use hypertor::{TorClient, TracingConfig};
-
-let client = TorClient::builder()
-    .tracing(TracingConfig {
-        enabled: true,
-        trace_circuits: true,
-        trace_requests: true,
-    })
-    .build().await?;
-
-// Traces include:
-// - Circuit establishment
-// - Request/response lifecycle
-// - Retry attempts
-// - Error details
-```
-
-## Error Handling
-
-```rust
-use hypertor::{TorClient, Error};
-
-match client.get("http://example.onion")?.send().await {
-    Ok(resp) => println!("Success: {}", resp.status()),
-    Err(Error::Timeout { operation, duration }) => {
-        println!("{} timed out after {:?}", operation, duration);
-    }
-    Err(Error::Connection { host, port, .. }) => {
-        println!("Failed to connect to {}:{}", host, port);
-    }
-    Err(Error::CircuitFailed { reason }) => {
-        println!("Circuit failed: {}", reason);
-    }
-    Err(Error::TorNetwork { code, message }) => {
-        println!("Tor network error {}: {}", code, message);
-    }
-    Err(e) => println!("Error: {}", e),
+match client.get(url)?.send().await {
+    Ok(response) => { /* ... */ }
+    Err(e) if e.is_timeout() => { /* deadline passed */ }
+    Err(e) if e.is_tor() => { /* bootstrap or circuit failure */ }
+    Err(e) if e.is_retryable() => { /* transient */ }
+    Err(e) => eprintln!("{e}"),
 }
 ```
 
-## Typed API Helpers
+**Hostnames are scrubbed from error messages.** Errors end up in logs and bug reports, and
+`connection to secretforum.onion:80 failed` is a leak. Use `Error::host()` when you need the value
+programmatically; it never redacts.
 
-For cleaner API interactions with typed serialization/deserialization:
-
-```rust
-use hypertor::TorClient;
-use serde::{Serialize, Deserialize};
-
-#[derive(Serialize)]
-struct CreateUser {
-    username: String,
-    email: String,
-}
-
-#[derive(Deserialize)]
-struct User {
-    id: u64,
-    username: String,
-    email: String,
-}
-
-// Typed POST returning deserialized response
-let user: User = client.post("http://api.onion/users")?
-    .json(&CreateUser {
-        username: "alice".into(),
-        email: "alice@example.com".into(),
-    })
-    .send().await?
-    .json()?;
-
-// Typed GET with automatic deserialization
-let users: Vec<User> = client.get("http://api.onion/users")?
-    .send().await?
-    .json()?;
-```
-
-## Proxy Chain Support
-
-Chain through additional proxies before Tor:
+## Resolving names
 
 ```rust
-use hypertor::{TorClient, ProxyConfig};
-
-let client = TorClient::builder()
-    // Chain through SOCKS5 proxy before Tor
-    .proxy(ProxyConfig::Socks5 {
-        host: "127.0.0.1".into(),
-        port: 1080,
-        auth: None,
-    })
-    .build().await?;
+let addrs = client.resolve("example.com").await?;
 ```
 
-## Next Steps
+The lookup is performed by an exit relay, never by your machine. You rarely need this: the client
+resolves names over Tor automatically when connecting.
 
-- [OnionApp Documentation](/docs/server/) — Host your own .onion service
-- [Security Features](/docs/security/) — PoW, Vanguards, Leak Detection
-- [Python Bindings](/docs/python/) — Full Python API reference
+## Sharing one Tor instance
+
+```rust
+let tor = arti_client::TorClient::create_bootstrapped(config).await?;
+
+let client = TorClient::from_arti(tor.clone(), Config::default())?;
+let service = OnionService::builder().on_client(tor).launch().await?;
+```
+
+Sharing one arti client means one directory cache and one guard set, which is both faster and better
+for anonymity than running two independent instances.

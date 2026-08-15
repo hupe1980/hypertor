@@ -1,6 +1,6 @@
 [package]
 name = "hypertor"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.86"
 authors = ["hupe1980"]
@@ -13,75 +13,90 @@ publish = true
 
 [lib]
 name = "hypertor"
-crate-type = ["cdylib", "rlib"]
+# `cdylib` is only needed for the Python extension module; adding it
+# unconditionally would force a dylib build for pure-Rust consumers.
+crate-type = ["rlib"]
 
 [features]
-# SECURITY: rustls is the default for consistent TLS fingerprinting across platforms
-# native-tls uses different implementations per OS (OpenSSL/SecureTransport/SChannel)
-# which can leak platform information and has had compatibility issues with Tor streams
-default = ["rustls", "client"]
+default = ["client", "rustls"]
 
-# Core features
+# --- Core capabilities -------------------------------------------------------
+# `client`  — TorClient: HTTP over Tor (hyper + arti).
+# `server`  — OnionService / OnionApp: host .onion services.
+# `socks`   — local SOCKS5 proxy front-end for the client.
+# `ws`      — WebSocket over Tor (tokio-tungstenite).
 client = []
-server = []
-intercept = []
-full = ["client", "server", "intercept", "rustls", "http2", "padding", "python"]
+server = ["dep:tor-hsservice", "dep:tor-hscrypto", "dep:tor-cell", "dep:mime_guess"]
 
-# TLS backends (pick one - rustls recommended for anonymity)
-# rustls: Pure Rust, consistent fingerprint, memory-safe, recommended
-# native-tls: Uses OS TLS stack, may have platform-specific issues
-native-tls = ["dep:tokio-native-tls", "arti-client/native-tls", "tor-rtcompat/native-tls", "tokio-tungstenite/native-tls"]
-rustls = ["dep:tokio-rustls", "dep:rustls-native-certs", "arti-client/rustls", "tor-rtcompat/rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
+# Proof-of-work DoS defence for onion services (Tor proposal 327, Equi-X).
+#
+# LICENSING: this pulls in `equix` and `hashx`, which are **LGPL-3.0-only**,
+# while hypertor itself is MIT. It is opt-in rather than default so that an
+# ordinary build — client or server — stays entirely permissively licensed.
+# Enable it only if LGPL-3.0 obligations are acceptable for your distribution.
+pow = ["server", "arti-client/hs-pow-full"]
+socks = ["client"]
+ws = ["client", "dep:tokio-tungstenite"]
 
-# HTTP versions  
-http2 = []
+# --- TLS backends (pick exactly one; rustls is strongly recommended) ---------
+# rustls gives an identical TLS fingerprint on every platform. native-tls uses
+# the OS stack (OpenSSL / SecureTransport / SChannel) and therefore leaks the
+# host operating system to any observer of the TLS handshake.
+rustls = [
+    "dep:tokio-rustls",
+    "dep:rustls-native-certs",
+    "arti-client/rustls",
+    "tor-rtcompat/rustls",
+    "tokio-tungstenite?/rustls-tls-native-roots",
+]
+native-tls = [
+    "dep:tokio-native-tls",
+    "arti-client/native-tls",
+    "tor-rtcompat/native-tls",
+    "tokio-tungstenite?/native-tls",
+]
 
-# Privacy features
-padding = []
-
-# Static linking (useful for Windows where system SQLite isn't available)
+# --- Optional extras ---------------------------------------------------------
+# Static SQLite: useful on Windows, where no system SQLite is available.
 static-sqlite = ["arti-client/static-sqlite"]
 
-# Python bindings
-python = ["dep:pyo3", "dep:pyo3-async-runtimes"]
+# Python bindings (built by maturin).
+python = ["dep:pyo3", "dep:pyo3-async-runtimes", "client", "server"]
+
+# `full` deliberately excludes `pow`, to keep the default dependency tree
+# permissively licensed. Add "pow" explicitly if you need it.
+full = ["client", "server", "socks", "ws", "rustls"]
 
 [dependencies]
-# Error handling - typed errors, NOT anyhow
+# --- Errors & logging --------------------------------------------------------
 thiserror = "2.0.18"
-
-# Logging
 tracing = "0.1"
 
-# HTTP stack
-hyper = { version = "1.8", features = ["http1", "http2", "client"] }
-hyper-util = { version = "0.1.19", features = ["tokio", "client-legacy"] }
+# --- HTTP stack --------------------------------------------------------------
+# hyper provides HTTP/1.1 *and* HTTP/2, connection pooling and keep-alive.
+# We plug a Tor connector into hyper-util's pooling client rather than
+# reimplementing any of it.
+hyper = { version = "1.8", features = ["http1", "http2", "client", "server"] }
+hyper-util = { version = "0.1.19", features = [
+    "tokio",
+    "client",
+    "client-legacy",
+    "server",
+    "server-graceful",
+    "service",
+    "http1",
+    "http2",
+] }
 http-body-util = "0.1"
 http-body = "1"
 http = "1.2"
 bytes = "1"
+tower-service = "0.3"
 
-# WebSocket support - tokio-tungstenite for real WebSocket over Tor
-# TLS backend is feature-gated to match the library's TLS configuration
-tokio-tungstenite = { version = "0.28", default-features = false }
-tungstenite = "0.28"
-
-# Tor - using arti (pure Rust implementation)
-# SECURITY: Always use latest versions for security patches
-# Features enabled:
-#   - tokio: async runtime
-#   - native-tls: TLS support
-#   - onion-service-client: connect to .onion addresses
-#   - onion-service-service: host .onion services
-#   - pt-client: pluggable transports for censorship circumvention
-#   - vanguards: path selection hardening
-#   - keymgr: secure key management (required for client auth)
-#   - restricted-discovery: client authorization for onion services
-#   - hs-pow-full: proof-of-work with Equi-X (full implementation)
-#   - geoip: geographic exit selection
-#   - bridge-client: bridge relay support
-#   - compression: directory compression
-# NOTE: TLS backend (native-tls/rustls) is controlled via hypertor features, not here
-arti-client = { version = "0.38", default-features = false, features = [
+# --- Tor (arti) --------------------------------------------------------------
+# SECURITY: keep this current. The Tor network retires obsolete protocol
+# versions, and outdated clients become both conspicuous and non-functional.
+arti-client = { version = "0.45", default-features = false, features = [
     "tokio",
     "compression",
     "onion-service-client",
@@ -91,56 +106,65 @@ arti-client = { version = "0.38", default-features = false, features = [
     "vanguards",
     "keymgr",
     "restricted-discovery",
-    "hs-pow-full",
     "geoip",
 ] }
-tor-rtcompat = { version = "0.38", default-features = false, features = ["tokio"] }
-tor-hsservice = { version = "0.38", default-features = false, features = ["restricted-discovery"] }
-tor-hscrypto = { version = "0.38" }
-tor-proto = { version = "0.38" }
-tor-cell = { version = "0.38" }
-tor-config = { version = "0.38" }
-tor-guardmgr = { version = "0.38" }
-tor-keymgr = { version = "0.38" }
-safelog = "0.7"
+tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio"] }
+tor-config = "0.45"
+tor-guardmgr = "0.45"
+safelog = "0.9"
 
-# Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
-tokio-stream = "0.1"
-pin-project-lite = "0.2"
+# Onion-service hosting only.
+tor-hsservice = { version = "0.45", default-features = false, features = [
+    "restricted-discovery",
+], optional = true }
+tor-hscrypto = { version = "0.45", optional = true }
+tor-cell = { version = "0.45", optional = true }
+
+# --- Async runtime -----------------------------------------------------------
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "net",
+    "io-util",
+    "fs",
+] }
 futures = "0.3"
+pin-project-lite = "0.2"
 
-# Compression support
+# --- Content encodings -------------------------------------------------------
 flate2 = "1.1"
 brotli = "8"
 zstd = "0.13.3"
 
-# Encoding
+# --- Encoding ----------------------------------------------------------------
 base64 = "0.22"
-urlencoding = "2.1"
+form_urlencoded = "1.2"
+percent-encoding = "2.3"
 
-# TLS backends (feature-gated)
-tokio-native-tls = { version = "0.3", optional = true }
+# --- TLS backends (feature-gated) --------------------------------------------
 tokio-rustls = { version = "0.26", features = ["ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
 
-# Python bindings (feature-gated)
+# --- WebSocket (feature-gated) ----------------------------------------------
+tokio-tungstenite = { version = "0.28", default-features = false, features = [
+    "handshake",
+], optional = true }
+
+# --- Python bindings (feature-gated) ----------------------------------------
 pyo3 = { version = "0.27", features = ["extension-module"], optional = true }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"], optional = true }
 
-# Utilities
+# --- Utilities ---------------------------------------------------------------
 parking_lot = "0.12.5"
-rand = "0.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-mime_guess = "2.0"
-bitflags = "2.10"
-chrono = { version = "0.4.43", features = ["serde"] }
-sha1 = "0.10"
-zeroize = { version = "1.8", features = ["derive"] }  # Secure memory cleanup for secrets
+mime_guess = { version = "2.0", optional = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
+tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 
@@ -148,15 +172,22 @@ criterion = { version = "0.8", features = ["html_reports"] }
 name = "benchmarks"
 harness = false
 
+# `panic = "abort"` is deliberately NOT set: this crate is built as a Python
+# extension module, and unwinding must be caught at the FFI boundary instead of
+# aborting the host interpreter.
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [[example]]
-name = "basic_usage"
-path = "examples/basic_usage.rs"
+name = "client"
+path = "examples/client.rs"
+required-features = ["client"]
 
 [[example]]
 name = "onion_service"
@@ -164,21 +195,29 @@ path = "examples/onion_service.rs"
 required-features = ["server"]
 
 [[example]]
-name = "secure_api_client"
-path = "examples/secure_api_client.rs"
-
-[[example]]
-name = "multiple_identities"
-path = "examples/multiple_identities.rs"
-
-[[example]]
-name = "realtime_patterns"
-path = "examples/realtime_patterns.rs"
+name = "isolation"
+path = "examples/isolation.rs"
+required-features = ["client"]
 
 [[example]]
 name = "socks_proxy"
 path = "examples/socks_proxy.rs"
+required-features = ["socks"]
 
 [[example]]
-name = "security_features"
-path = "examples/security_features.rs"
+name = "bridges"
+path = "examples/bridges.rs"
+required-features = ["client"]
+
+[[example]]
+name = "websocket"
+path = "examples/websocket.rs"
+required-features = ["ws"]
+
+[[test]]
+name = "client"
+required-features = ["client"]
+
+[[test]]
+name = "server"
+required-features = ["server"]

@@ -1,104 +1,98 @@
-//! Python response bindings
+//! Python response bindings.
+
+use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::response::Response;
 
-/// HTTP Response for Python
+use super::client::{HypertorError, to_py_err};
+
+/// An HTTP response.
 #[pyclass(name = "Response")]
 pub struct PyResponse {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    inner: Response,
 }
 
 impl From<Response> for PyResponse {
-    fn from(resp: Response) -> Self {
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|v| (k.as_str().to_string(), v.to_string()))
-            })
-            .collect();
-
-        Self {
-            status: resp.status_code(),
-            headers,
-            body: resp.into_bytes().to_vec(),
-        }
+    fn from(inner: Response) -> Self {
+        Self { inner }
     }
 }
 
 #[pymethods]
 impl PyResponse {
-    /// Get the HTTP status code
+    /// The HTTP status code.
     #[getter]
     fn status_code(&self) -> u16 {
-        self.status
+        self.inner.status().as_u16()
     }
 
-    /// Check if the response is successful (2xx)
+    /// Whether the status is 2xx.
     #[getter]
     fn ok(&self) -> bool {
-        (200..300).contains(&self.status)
+        self.inner.is_success()
     }
 
-    /// Check if the response is a redirect (3xx)
+    /// The response headers, lowercased.
     #[getter]
-    fn is_redirect(&self) -> bool {
-        (300..400).contains(&self.status)
-    }
-
-    /// Get the response headers as a list of tuples
-    #[getter]
-    fn headers(&self) -> Vec<(String, String)> {
-        self.headers.clone()
-    }
-
-    /// Get a specific header value
-    fn header(&self, name: &str) -> Option<String> {
-        let name_lower = name.to_lowercase();
-        self.headers
+    fn headers(&self) -> HashMap<String, String> {
+        self.inner
+            .headers()
             .iter()
-            .find(|(k, _)| k.to_lowercase() == name_lower)
-            .map(|(_, v)| v.clone())
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect()
     }
 
-    /// Get the Content-Type header
+    /// The raw response body.
     #[getter]
-    fn content_type(&self) -> Option<String> {
-        self.header("content-type")
-    }
-
-    /// Get the response body as text
-    fn text(&self) -> PyResult<String> {
-        String::from_utf8(self.body.clone())
-            .map_err(|e| pyo3::exceptions::PyUnicodeDecodeError::new_err(e.to_string()))
-    }
-
-    /// Get the response body as bytes
     fn content<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.body)
+        PyBytes::new(py, self.inner.bytes())
     }
 
-    /// Get the length of the response body
-    fn __len__(&self) -> usize {
-        self.body.len()
+    /// The body decoded as UTF-8 text.
+    #[getter]
+    fn text(&self) -> PyResult<String> {
+        self.inner.text().map_err(to_py_err)
     }
 
-    /// String representation
-    fn __repr__(&self) -> String {
-        format!("<Response [{}]>", self.status)
-    }
-
-    /// Get the response body as JSON (parsed by Python's json module)
+    /// The body parsed as JSON.
+    ///
+    /// Parsed by Python's own `json` module so the result contains ordinary
+    /// dicts and lists rather than a foreign object graph.
     fn json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let text = self.text()?;
-        let json_module = py.import("json")?;
-        json_module.call_method1("loads", (text,))
+        let text = self.inner.text().map_err(to_py_err)?;
+        py.import("json")?.call_method1("loads", (text,))
+    }
+
+    /// Raise if the status is not 2xx.
+    fn raise_for_status(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if slf.inner.is_success() {
+            Ok(slf)
+        } else {
+            Err(HypertorError::new_err(format!(
+                "server returned {} {}",
+                slf.inner.status().as_u16(),
+                slf.inner.status().canonical_reason().unwrap_or("")
+            )))
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<hypertor.Response [{}] {} bytes>",
+            self.inner.status().as_u16(),
+            self.inner.len()
+        )
     }
 }

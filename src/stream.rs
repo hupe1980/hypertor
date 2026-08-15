@@ -1,75 +1,69 @@
-//! Zero-cost stream abstraction using enum dispatch
+//! A Tor stream, optionally wrapped in TLS.
 //!
-//! This module provides a unified stream type that can be either:
-//! - Plain TCP over Tor (for HTTP)
-//! - TLS-wrapped TCP over Tor (for HTTPS)
-//!
-//! Using an enum instead of `Box<dyn>` enables:
-//! - Zero heap allocation for the wrapper itself
-//! - Compile-time dispatch optimization
-//! - Better inlining opportunities
-//!
-//! # TLS Backend Priority
-//!
-//! When both `rustls` and `native-tls` features are enabled, **rustls takes priority**
-//! for better anonymity (consistent TLS fingerprint across platforms).
+//! Enum dispatch rather than `Box<dyn>`: no allocation for the wrapper and the
+//! compiler can inline through it.
 
-use arti_client::DataStream;
-use pin_project_lite::pin_project;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+use arti_client::DataStream;
+use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-use tokio_native_tls::TlsStream as NativeTlsStream;
+// `pin_project!` cannot apply `#[cfg]` to individual variants, so the enum is
+// declared once per TLS backend. Exactly one of these is ever compiled.
 
-#[cfg(feature = "rustls")]
-use tokio_rustls::client::TlsStream as RustlsStream;
-
-// PRIORITY: rustls > native-tls (for consistent TLS fingerprinting)
-// When rustls is enabled, use it regardless of native-tls
 #[cfg(feature = "rustls")]
 pin_project! {
-    /// A stream that can be either plain or TLS-encrypted (rustls backend)
+    /// A byte stream carried over the Tor network.
+    ///
+    /// `Plain` is already anonymised and, for `.onion` targets, also encrypted
+    /// and authenticated end-to-end by Tor itself. The TLS variant adds
+    /// certificate-authenticated encryption for clearnet targets, which is
+    /// necessary because the exit relay would otherwise see the plaintext.
     #[project = TorStreamProj]
     #[allow(missing_docs)]
     pub enum TorStream {
+        /// An unwrapped Tor stream.
         Plain {
             #[pin]
             inner: DataStream,
         },
-        Rustls {
+        /// A TLS session over a Tor stream.
+        Tls {
             #[pin]
-            inner: RustlsStream<DataStream>,
+            inner: Box<tokio_rustls::client::TlsStream<DataStream>>,
         },
     }
 }
 
-// Only use native-tls when rustls is NOT enabled
 #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
 pin_project! {
-    /// A stream that can be either plain or TLS-encrypted (native-tls backend)
+    /// A byte stream carried over the Tor network.
     #[project = TorStreamProj]
     #[allow(missing_docs)]
     pub enum TorStream {
+        /// An unwrapped Tor stream.
         Plain {
             #[pin]
             inner: DataStream,
         },
-        NativeTls {
+        /// A TLS session over a Tor stream.
+        Tls {
             #[pin]
-            inner: NativeTlsStream<DataStream>,
+            inner: Box<tokio_native_tls::TlsStream<DataStream>>,
         },
     }
 }
 
-#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+#[cfg(not(any(feature = "rustls", feature = "native-tls")))]
 pin_project! {
-    /// A stream that can be either plain or TLS-encrypted (no TLS backend)
+    /// A byte stream carried over the Tor network.
     #[project = TorStreamProj]
     #[allow(missing_docs)]
     pub enum TorStream {
+        /// An unwrapped Tor stream.
         Plain {
             #[pin]
             inner: DataStream,
@@ -78,32 +72,53 @@ pin_project! {
 }
 
 impl TorStream {
-    /// Create a new plain (non-TLS) stream
+    /// Wrap a raw Tor stream.
     pub fn plain(stream: DataStream) -> Self {
         Self::Plain { inner: stream }
     }
 
-    /// Create a new TLS stream using native-tls
-    #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-    pub fn native_tls(stream: NativeTlsStream<DataStream>) -> Self {
-        Self::NativeTls { inner: stream }
-    }
-
-    /// Create a new TLS stream using rustls
+    /// Wrap a completed rustls session.
     #[cfg(feature = "rustls")]
-    pub fn rustls(stream: RustlsStream<DataStream>) -> Self {
-        Self::Rustls { inner: stream }
+    pub fn rustls(stream: tokio_rustls::client::TlsStream<DataStream>) -> Self {
+        Self::Tls {
+            inner: Box::new(stream),
+        }
     }
 
-    /// Returns true if this is a TLS-encrypted stream
+    /// Wrap a completed native-tls session.
+    #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+    pub fn native_tls(stream: tokio_native_tls::TlsStream<DataStream>) -> Self {
+        Self::Tls {
+            inner: Box::new(stream),
+        }
+    }
+
+    /// Whether this stream is TLS-encrypted in addition to being carried by Tor.
     pub fn is_tls(&self) -> bool {
+        !matches!(self, Self::Plain { .. })
+    }
+
+    /// Whether the TLS handshake negotiated HTTP/2 via ALPN.
+    ///
+    /// Always `false` for plain streams: without TLS there is no ALPN, so h2
+    /// would require prior knowledge, which hypertor does not assume.
+    pub fn alpn_is_h2(&self) -> bool {
         match self {
             Self::Plain { .. } => false,
-            #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-            Self::NativeTls { .. } => true,
             #[cfg(feature = "rustls")]
-            Self::Rustls { .. } => true,
+            Self::Tls { inner } => inner.get_ref().1.alpn_protocol() == Some(b"h2"),
+            // native-tls exposes no ALPN accessor.
+            #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+            Self::Tls { .. } => false,
         }
+    }
+}
+
+impl std::fmt::Debug for TorStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TorStream")
+            .field("tls", &self.is_tls())
+            .finish_non_exhaustive()
     }
 }
 
@@ -115,10 +130,8 @@ impl AsyncRead for TorStream {
     ) -> Poll<io::Result<()>> {
         match self.project() {
             TorStreamProj::Plain { inner } => inner.poll_read(cx, buf),
-            #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-            TorStreamProj::NativeTls { inner } => inner.poll_read(cx, buf),
-            #[cfg(feature = "rustls")]
-            TorStreamProj::Rustls { inner } => inner.poll_read(cx, buf),
+            #[cfg(any(feature = "rustls", feature = "native-tls"))]
+            TorStreamProj::Tls { inner } => inner.poll_read(cx, buf),
         }
     }
 }
@@ -131,30 +144,24 @@ impl AsyncWrite for TorStream {
     ) -> Poll<io::Result<usize>> {
         match self.project() {
             TorStreamProj::Plain { inner } => inner.poll_write(cx, buf),
-            #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-            TorStreamProj::NativeTls { inner } => inner.poll_write(cx, buf),
-            #[cfg(feature = "rustls")]
-            TorStreamProj::Rustls { inner } => inner.poll_write(cx, buf),
+            #[cfg(any(feature = "rustls", feature = "native-tls"))]
+            TorStreamProj::Tls { inner } => inner.poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.project() {
             TorStreamProj::Plain { inner } => inner.poll_flush(cx),
-            #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-            TorStreamProj::NativeTls { inner } => inner.poll_flush(cx),
-            #[cfg(feature = "rustls")]
-            TorStreamProj::Rustls { inner } => inner.poll_flush(cx),
+            #[cfg(any(feature = "rustls", feature = "native-tls"))]
+            TorStreamProj::Tls { inner } => inner.poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.project() {
             TorStreamProj::Plain { inner } => inner.poll_shutdown(cx),
-            #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-            TorStreamProj::NativeTls { inner } => inner.poll_shutdown(cx),
-            #[cfg(feature = "rustls")]
-            TorStreamProj::Rustls { inner } => inner.poll_shutdown(cx),
+            #[cfg(any(feature = "rustls", feature = "native-tls"))]
+            TorStreamProj::Tls { inner } => inner.poll_shutdown(cx),
         }
     }
 }

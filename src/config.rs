@@ -1,228 +1,295 @@
-//! Configuration for hypertor client
+//! Client configuration.
 //!
-//! Provides a builder pattern for creating client configurations with
-//! security-hardened defaults.
+//! Every field here is read by the client at runtime. If an option exists, it
+//! does something.
 
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::isolation::IsolationLevel;
+use crate::redirect::RedirectPolicy;
 
-/// Client configuration
+/// The User-Agent hypertor sends by default.
+///
+/// This matches the Tor Browser's User-Agent so that hypertor requests blend
+/// into the largest available anonymity set rather than announcing themselves.
+///
+/// Tor Browser is built on the Firefox Extended Support Release, and its
+/// User-Agent changes roughly once a year when a new ESR ships. If you are
+/// building something long-lived, pin your own value with
+/// [`ConfigBuilder::user_agent`] and update it deliberately — a stale default
+/// is more identifying than a current one.
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+/// Client configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
-    /// Request timeout
+    /// Deadline for a whole request, including circuit setup and redirects.
     pub timeout: Duration,
-    /// Maximum number of pooled connections
-    pub max_connections: usize,
-    /// Maximum response body size (DoS protection)
+    /// Deadline for opening one Tor stream and completing its TLS handshake.
+    pub connect_timeout: Duration,
+    /// Maximum idle connections kept alive per destination host.
+    pub pool_max_idle_per_host: usize,
+    /// How long an idle pooled connection is kept before being closed.
+    pub pool_idle_timeout: Duration,
+    /// Maximum response body size accepted, in bytes.
+    ///
+    /// Enforced *while streaming*, so an oversized body is aborted rather than
+    /// buffered. Also applied to the decompressed size, which bounds
+    /// decompression bombs.
     pub max_response_size: usize,
-    /// Stream isolation level
+    /// Circuit isolation strategy.
     pub isolation: IsolationLevel,
-    /// Security configuration
-    pub security: SecurityConfig,
-    /// User-Agent header (uses Tor Browser's by default for anonymity)
+    /// The User-Agent to send. Defaults to [`DEFAULT_USER_AGENT`].
     pub user_agent: String,
-    /// Whether to follow HTTP redirects
-    pub follow_redirects: bool,
-    /// Maximum number of redirects to follow
-    pub max_redirects: u8,
+    /// How redirects are handled.
+    pub redirect: RedirectPolicy,
+    /// Number of times a failed request is retried on a fresh circuit.
+    ///
+    /// Only failures for which [`Error::is_retryable`](crate::Error::is_retryable)
+    /// holds are retried, and only for idempotent requests.
+    pub max_retries: u32,
+    /// Whether to accept and transparently decode compressed responses.
+    pub compression: bool,
+    /// TLS behaviour.
+    pub tls: TlsConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Reasonable timeout for Tor latency
+            // Tor adds several hundred ms per hop; 30 s is generous for a
+            // request on an established circuit and tolerable for a cold one.
             timeout: Duration::from_secs(30),
-            // Connection pool size
-            max_connections: 10,
-            // 10MB max response (DoS protection)
-            max_response_size: 10 * 1024 * 1024,
-            // Default isolation
-            isolation: IsolationLevel::None,
-            // Security defaults
-            security: SecurityConfig::default(),
-            // Tor Browser User-Agent for anonymity set
-            user_agent: "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
-                .to_string(),
-            // Redirects off by default (security)
-            follow_redirects: false,
-            max_redirects: 5,
+            connect_timeout: Duration::from_secs(60),
+            pool_max_idle_per_host: 4,
+            pool_idle_timeout: Duration::from_secs(90),
+            max_response_size: 16 * 1024 * 1024,
+            isolation: IsolationLevel::default(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            redirect: RedirectPolicy::default(),
+            max_retries: 2,
+            compression: true,
+            tls: TlsConfig::default(),
         }
     }
 }
 
 impl Config {
-    /// Create a new configuration builder
+    /// Start building a configuration.
     pub fn builder() -> ConfigBuilder {
-        ConfigBuilder::new()
+        ConfigBuilder::default()
     }
 }
 
-/// Security-specific configuration
+/// TLS behaviour for clearnet (`https://`) targets.
+///
+/// This does not apply to `.onion` addresses: connections to an onion service
+/// are end-to-end encrypted and authenticated by the Tor rendezvous protocol
+/// itself, and the `.onion` name *is* the public key.
 #[derive(Debug, Clone)]
-pub struct SecurityConfig {
-    /// Strip Referer header to prevent privacy leaks
-    pub strip_referer: bool,
-    /// Verify TLS certificates
-    pub verify_tls: bool,
-    /// Minimum TLS version
-    pub min_tls_version: TlsVersion,
-    /// Allowed TLS cipher suites (empty = all secure defaults)
-    pub cipher_suites: Vec<String>,
+#[non_exhaustive]
+pub struct TlsConfig {
+    /// Verify server certificates against the system trust store.
+    ///
+    /// Disabling this makes every `https://` connection trivially
+    /// interceptable by the exit relay. It exists for testing against local
+    /// services with self-signed certificates and nothing else.
+    pub verify_certificates: bool,
+    /// Lowest acceptable TLS version.
+    pub min_version: TlsVersion,
+    /// Offer HTTP/2 via ALPN, falling back to HTTP/1.1.
+    pub alpn_h2: bool,
 }
 
-impl Default for SecurityConfig {
+impl Default for TlsConfig {
     fn default() -> Self {
         Self {
-            strip_referer: true,
-            verify_tls: true,
-            min_tls_version: TlsVersion::Tls12,
-            cipher_suites: Vec::new(),
+            verify_certificates: true,
+            // TLS 1.2 is the floor. 1.3 is negotiated whenever the peer
+            // supports it; requiring it outright still breaks a meaningful
+            // slice of the long tail.
+            min_version: TlsVersion::Tls12,
+            alpn_h2: true,
         }
     }
 }
 
-/// Minimum TLS version
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Minimum acceptable TLS version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum TlsVersion {
-    /// TLS 1.2
+    /// TLS 1.2.
+    #[default]
     Tls12,
-    /// TLS 1.3
+    /// TLS 1.3 only.
     Tls13,
 }
 
-/// Builder for client configuration
-#[derive(Debug, Clone)]
+/// Builder for [`Config`].
+#[derive(Debug, Clone, Default)]
 pub struct ConfigBuilder {
     config: Config,
 }
 
 impl ConfigBuilder {
-    /// Create a new builder with default values
-    pub fn new() -> Self {
-        Self {
-            config: Config::default(),
-        }
-    }
-
-    /// Set the request timeout
+    /// Deadline for a whole request, including circuit setup and redirects.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.config.timeout = timeout;
         self
     }
 
-    /// Set the maximum number of pooled connections
-    pub fn max_connections(mut self, max: usize) -> Self {
-        self.config.max_connections = max;
+    /// Deadline for opening one Tor stream and completing its TLS handshake.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
-    /// Set the maximum response body size
+    /// Maximum idle connections kept alive per destination host.
+    pub fn pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.config.pool_max_idle_per_host = max;
+        self
+    }
+
+    /// How long an idle pooled connection is kept before being closed.
+    pub fn pool_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.config.pool_idle_timeout = timeout;
+        self
+    }
+
+    /// Maximum response body size accepted, in bytes.
     pub fn max_response_size(mut self, size: usize) -> Self {
         self.config.max_response_size = size;
         self
     }
 
-    /// Set the stream isolation level
+    /// Circuit isolation strategy.
     pub fn isolation(mut self, level: IsolationLevel) -> Self {
         self.config.isolation = level;
         self
     }
 
-    /// Set the User-Agent header
+    /// The User-Agent to send.
+    ///
+    /// Changing this away from [`DEFAULT_USER_AGENT`] shrinks your anonymity
+    /// set. Do it when you are talking to an API that requires it, not by
+    /// default.
     pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
         self.config.user_agent = ua.into();
         self
     }
 
-    /// Enable or disable following redirects
-    pub fn follow_redirects(mut self, follow: bool) -> Self {
-        self.config.follow_redirects = follow;
+    /// How redirects are handled.
+    pub fn redirect(mut self, policy: RedirectPolicy) -> Self {
+        self.config.redirect = policy;
         self
     }
 
-    /// Set the maximum number of redirects to follow
-    pub fn max_redirects(mut self, max: u8) -> Self {
-        self.config.max_redirects = max;
+    /// Number of retries on a fresh circuit for retryable failures.
+    pub fn max_retries(mut self, retries: u32) -> Self {
+        self.config.max_retries = retries;
         self
     }
 
-    /// Strip Referer header from requests
-    pub fn strip_referer(mut self, strip: bool) -> Self {
-        self.config.security.strip_referer = strip;
+    /// Whether to accept and transparently decode compressed responses.
+    pub fn compression(mut self, enabled: bool) -> Self {
+        self.config.compression = enabled;
         self
     }
 
-    /// Enable or disable TLS certificate verification
+    /// Lowest acceptable TLS version for `https://` targets.
+    pub fn min_tls_version(mut self, version: TlsVersion) -> Self {
+        self.config.tls.min_version = version;
+        self
+    }
+
+    /// Offer HTTP/2 via ALPN for `https://` targets.
+    pub fn http2(mut self, enabled: bool) -> Self {
+        self.config.tls.alpn_h2 = enabled;
+        self
+    }
+
+    /// Disable TLS certificate verification.
     ///
     /// # Warning
-    /// Disabling this is a security risk and should only be done for testing
-    pub fn verify_tls(mut self, verify: bool) -> Self {
-        self.config.security.verify_tls = verify;
+    ///
+    /// This makes every `https://` connection interceptable by the exit relay,
+    /// which is an untrusted party by design. Only use it against local test
+    /// servers.
+    pub fn danger_accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.config.tls.verify_certificates = !accept;
         self
     }
 
-    /// Set the minimum TLS version
-    pub fn min_tls_version(mut self, version: TlsVersion) -> Self {
-        self.config.security.min_tls_version = version;
-        self
-    }
-
-    /// Build the configuration
+    /// Validate and produce the [`Config`].
     pub fn build(self) -> Result<Config> {
-        // Validate configuration
-        if self.config.timeout.is_zero() {
-            return Err(Error::config("timeout cannot be zero"));
+        let c = &self.config;
+        if c.timeout.is_zero() {
+            return Err(Error::config("timeout must be greater than zero"));
         }
-        if self.config.max_connections == 0 {
-            return Err(Error::config("max_connections must be at least 1"));
+        if c.connect_timeout.is_zero() {
+            return Err(Error::config("connect_timeout must be greater than zero"));
         }
-        if self.config.max_response_size == 0 {
-            return Err(Error::config("max_response_size must be at least 1"));
+        if c.max_response_size == 0 {
+            return Err(Error::config(
+                "max_response_size must be greater than zero; \
+                 use a large value rather than 0 to mean 'unlimited'",
+            ));
         }
-
+        if c.user_agent.is_empty() {
+            return Err(Error::config("user_agent must not be empty"));
+        }
+        if http::HeaderValue::from_str(&c.user_agent).is_err() {
+            return Err(Error::config(
+                "user_agent contains characters that are not valid in an HTTP header",
+            ));
+        }
         Ok(self.config)
-    }
-}
-
-impl Default for ConfigBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
-    fn test_default_config() {
-        let config = Config::default();
-        assert_eq!(config.timeout, Duration::from_secs(30));
-        assert_eq!(config.max_connections, 10);
-        assert!(!config.follow_redirects);
-        assert!(config.security.verify_tls);
+    fn defaults_are_sane() {
+        let c = Config::default();
+        assert!(c.tls.verify_certificates);
+        assert!(c.compression);
+        assert_eq!(c.user_agent, DEFAULT_USER_AGENT);
+        // Redirects are followed by default, matching every other HTTP client.
+        assert!(c.redirect.is_enabled());
     }
 
     #[test]
-    fn test_builder() {
-        let config = Config::builder()
-            .timeout(Duration::from_secs(60))
-            .max_connections(20)
-            .follow_redirects(true)
+    fn zero_values_are_rejected() {
+        assert!(Config::builder().timeout(Duration::ZERO).build().is_err());
+        assert!(Config::builder().max_response_size(0).build().is_err());
+        assert!(Config::builder().user_agent("").build().is_err());
+    }
+
+    #[test]
+    fn user_agent_with_control_characters_is_rejected() {
+        assert!(
+            Config::builder()
+                .user_agent("evil\r\nX-Injected: 1")
+                .build()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn builder_round_trips() {
+        let c = Config::builder()
+            .timeout(Duration::from_secs(90))
+            .max_retries(5)
+            .compression(false)
             .build()
-            .expect("config should be valid");
-
-        assert_eq!(config.timeout, Duration::from_secs(60));
-        assert_eq!(config.max_connections, 20);
-        assert!(config.follow_redirects);
-    }
-
-    #[test]
-    fn test_builder_validation() {
-        let result = Config::builder().max_connections(0).build();
-        assert!(result.is_err());
+            .expect("valid config");
+        assert_eq!(c.timeout, Duration::from_secs(90));
+        assert_eq!(c.max_retries, 5);
+        assert!(!c.compression);
     }
 }

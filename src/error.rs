@@ -1,361 +1,459 @@
-//! Typed error handling for hypertor
+//! Typed errors for hypertor.
 //!
-//! All errors are typed using `thiserror` for:
-//! - Compile-time error checking
-//! - Pattern matching on error variants  
-//! - Python exception mapping
-//! - Zero panics guarantee
+//! Every fallible operation returns [`enum@Error`], a `thiserror` enum you can match
+//! on. There is no `anyhow`-style opaque error and no stringly-typed failure.
+//!
+//! # Hostnames are scrubbed by default
+//!
+//! Error messages routinely end up in logs, bug reports and crash handlers. For
+//! a library whose whole purpose is anonymity, an error like
+//! `connection to secretforum7xyz.onion:80 failed` is a leak.
+//!
+//! Every host in this module is therefore wrapped in [`safelog::Sensitive`],
+//! which renders as `[scrubbed]` unless the application explicitly opts in via
+//! [`safelog::disable_safe_logging`]. Use [`Error::host`] when you need the real
+//! value programmatically — that accessor never redacts.
 
 use std::time::Duration;
+
+use safelog::Sensitive;
 use thiserror::Error;
 
-/// Result type alias for hypertor operations
+/// Result alias used throughout hypertor.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// All errors that can occur in hypertor
+/// A boxed underlying error, preserved as the [`std::error::Error::source`].
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Everything that can go wrong in hypertor.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
-    // =========================================================================
-    // Tor Network Errors
-    // =========================================================================
-    /// Failed to bootstrap the Tor client
+    // ------------------------------------------------------------------
+    // Tor
+    // ------------------------------------------------------------------
+    /// The Tor client could not bootstrap (fetch a directory and build circuits).
     #[error("Tor bootstrap failed: {message}")]
     Bootstrap {
-        /// Human-readable error message
+        /// What went wrong.
         message: String,
-        /// Underlying arti error
+        /// The underlying arti error.
         #[source]
         source: Option<BoxedError>,
     },
 
-    /// Failed to establish connection through Tor
-    #[error("Connection to {host}:{port} failed")]
-    Connection {
-        /// Target hostname
-        host: String,
-        /// Target port
+    /// A stream to the target could not be opened over Tor.
+    #[error("connection to {host}:{port} failed")]
+    Connect {
+        /// Target host (scrubbed when displayed).
+        host: Sensitive<String>,
+        /// Target port.
         port: u16,
-        /// Underlying error
+        /// The underlying arti error.
         #[source]
         source: BoxedError,
     },
 
-    /// Circuit creation failed
-    #[error("Failed to create Tor circuit: {message}")]
-    Circuit {
-        /// Error details
+    // ------------------------------------------------------------------
+    // TLS
+    // ------------------------------------------------------------------
+    /// The TLS handshake with the target failed.
+    #[error("TLS handshake with {host} failed")]
+    TlsHandshake {
+        /// Target host (scrubbed when displayed).
+        host: Sensitive<String>,
+        /// The underlying TLS error.
+        #[source]
+        source: BoxedError,
+    },
+
+    /// The TLS stack could not be configured.
+    #[error("TLS configuration error: {message}")]
+    Tls {
+        /// What went wrong.
         message: String,
-        /// Underlying error
+    },
+
+    // ------------------------------------------------------------------
+    // HTTP
+    // ------------------------------------------------------------------
+    /// A protocol-level HTTP failure (handshake, framing, transport).
+    #[error("HTTP error: {message}")]
+    Http {
+        /// What went wrong.
+        message: String,
+        /// The underlying hyper error.
         #[source]
         source: Option<BoxedError>,
     },
 
-    // =========================================================================
-    // TLS Errors
-    // =========================================================================
-    /// TLS handshake failed
-    #[error("TLS handshake failed for {host}")]
-    TlsHandshake {
-        /// Target hostname
-        host: String,
-        /// Underlying TLS error
-        #[source]
-        source: BoxedError,
-    },
-
-    /// TLS configuration error
-    #[error("TLS configuration error: {message}")]
-    TlsConfig {
-        /// Error details
+    /// The request could not be built or was rejected before being sent.
+    #[error("invalid request: {message}")]
+    InvalidRequest {
+        /// What is wrong with the request.
         message: String,
     },
 
-    /// Certificate verification failed
-    #[error("Certificate verification failed for {host}: {reason}")]
-    CertificateVerification {
-        /// Target hostname
-        host: String,
-        /// Reason for failure
+    /// The URL could not be parsed, or is not usable over Tor.
+    #[error("invalid URL: {reason}")]
+    InvalidUrl {
+        /// Why the URL was rejected.
         reason: String,
     },
 
-    // =========================================================================
-    // HTTP Errors
-    // =========================================================================
-    /// HTTP protocol error
-    #[error("HTTP error: {message}")]
-    Http {
-        /// Error details
-        message: String,
-        /// Underlying hyper error
-        #[source]
-        source: Option<BoxedError>,
-    },
-
-    /// Invalid HTTP request
-    #[error("Invalid request: {message}")]
-    InvalidRequest {
-        /// What's wrong with the request
-        message: String,
-    },
-
-    /// Response body too large
-    #[error("Response too large: {size} bytes exceeds limit of {limit} bytes")]
-    ResponseTooLarge {
-        /// Actual response size
+    /// The response body exceeded the configured limit.
+    ///
+    /// `size` is the number of bytes seen when the limit tripped; the body is
+    /// not buffered any further, so this is not a full content length.
+    #[error("response body exceeds limit of {limit} bytes")]
+    BodyTooLarge {
+        /// Bytes observed before aborting.
         size: usize,
-        /// Configured limit
+        /// The configured limit.
         limit: usize,
     },
 
-    /// Invalid URL
-    #[error("Invalid URL: {url}")]
-    InvalidUrl {
-        /// The invalid URL
-        url: String,
-        /// What's wrong with it
-        reason: String,
-    },
-
-    /// Missing hostname in URL
-    #[error("URL missing hostname")]
-    MissingHost,
-
-    /// Too many redirects
-    #[error("Too many redirects: {count} (limit: {limit})")]
+    /// The redirect chain exceeded the configured limit.
+    #[error("too many redirects (limit: {limit})")]
     TooManyRedirects {
-        /// Number of redirects followed
-        count: u32,
-        /// Maximum allowed
-        limit: u32,
+        /// The configured limit.
+        limit: usize,
     },
 
-    // =========================================================================
-    // Timeout Errors
-    // =========================================================================
-    /// Operation timed out
+    /// A response body used a Content-Encoding that could not be decoded.
+    #[error("could not decode response body: {message}")]
+    Decode {
+        /// What went wrong.
+        message: String,
+    },
+
+    // ------------------------------------------------------------------
+    // Timing
+    // ------------------------------------------------------------------
+    /// An operation exceeded its deadline.
     #[error("{operation} timed out after {duration:?}")]
     Timeout {
-        /// What operation timed out
-        operation: String,
-        /// How long we waited
+        /// The operation that timed out.
+        operation: &'static str,
+        /// The deadline that elapsed.
         duration: Duration,
     },
 
-    /// Connection pool exhausted
-    #[error("Connection pool exhausted, max {max_connections} connections")]
-    PoolExhausted {
-        /// Maximum configured connections
-        max_connections: usize,
-    },
-
-    // =========================================================================
-    // I/O Errors
-    // =========================================================================
-    /// Generic I/O error
-    #[error("I/O error: {message}")]
-    Io {
-        /// Error context
+    // ------------------------------------------------------------------
+    // Onion services
+    // ------------------------------------------------------------------
+    /// Hosting or reaching an onion service failed.
+    #[error("onion service error: {message}")]
+    OnionService {
+        /// What went wrong.
         message: String,
-        /// Underlying I/O error
+        /// The underlying arti error.
         #[source]
-        source: std::io::Error,
+        source: Option<BoxedError>,
     },
 
-    // =========================================================================
-    // Configuration Errors
-    // =========================================================================
-    /// Invalid configuration
-    #[error("Configuration error: {message}")]
+    // ------------------------------------------------------------------
+    // Configuration & I/O
+    // ------------------------------------------------------------------
+    /// The configuration is invalid or internally inconsistent.
+    #[error("configuration error: {message}")]
     Config {
-        /// What's wrong with the configuration
+        /// What is wrong with the configuration.
         message: String,
     },
 
-    /// Protocol error (SOCKS5, etc.)
-    #[error("Protocol error: {0}")]
-    Protocol(String),
+    /// An underlying I/O operation failed.
+    #[error("I/O error")]
+    Io(#[from] std::io::Error),
 }
 
-/// Boxed error for storing heterogeneous error sources
-pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
 impl Error {
-    /// Create a bootstrap error
-    pub fn bootstrap(message: impl Into<String>) -> Self {
-        Self::Bootstrap {
-            message: message.into(),
-            source: None,
+    /// The target host this error refers to, **unredacted**.
+    ///
+    /// Returns `None` for errors that are not tied to a specific host. Use this
+    /// when you need to act on the host programmatically; prefer the `Display`
+    /// impl whenever the value may reach a log.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Error::Connect { host, .. } | Error::TlsHandshake { host, .. } => {
+                Some(host.as_inner().as_str())
+            }
+            _ => None,
         }
     }
 
-    /// Create a bootstrap error with source
-    pub fn bootstrap_with_source(
-        message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::Bootstrap {
+    /// Whether retrying the same request has a realistic chance of succeeding.
+    ///
+    /// Circuit and connection failures are transient by nature — Tor will pick a
+    /// different path on the next attempt. Configuration and request-shape
+    /// errors are not retryable, and neither are timeouts of the *whole*
+    /// operation, since the caller's deadline has already passed.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Error::Connect { .. } | Error::TlsHandshake { .. } => true,
+            Error::Http { .. } => true,
+            Error::Bootstrap { .. } => false,
+            Error::Timeout { .. } => false,
+            _ => false,
+        }
+    }
+
+    /// Whether this error came from the Tor layer rather than from HTTP.
+    pub fn is_tor(&self) -> bool {
+        matches!(self, Error::Bootstrap { .. } | Error::Connect { .. })
+    }
+
+    /// Whether this error is a timeout.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Timeout { .. })
+    }
+
+    /// Rebuild an owned error of the same kind from a borrowed one.
+    ///
+    /// hyper boxes our connector errors behind `dyn Error`, so a failed request
+    /// only gives us a `&Error` back. `Error` is not `Clone` — the boxed
+    /// sources are not — but the *variant* has to survive that round trip, or
+    /// [`is_retryable`](Self::is_retryable) and [`is_tor`](Self::is_tor) would
+    /// report the wrong thing for exactly the failures that matter most.
+    ///
+    /// The underlying source is dropped; its message is folded into the text.
+    pub(crate) fn same_kind(&self) -> Error {
+        let detail = || {
+            std::error::Error::source(self)
+                .map(|s| format!("{self}: {s}"))
+                .unwrap_or_else(|| self.to_string())
+        };
+
+        match self {
+            Error::Connect { host, port, .. } => Error::Connect {
+                host: host.clone(),
+                port: *port,
+                source: Box::new(Detail(detail())),
+            },
+            Error::TlsHandshake { host, .. } => Error::TlsHandshake {
+                host: host.clone(),
+                source: Box::new(Detail(detail())),
+            },
+            Error::Bootstrap { message, .. } => Error::Bootstrap {
+                message: message.clone(),
+                source: None,
+            },
+            Error::Timeout {
+                operation,
+                duration,
+            } => Error::Timeout {
+                operation,
+                duration: *duration,
+            },
+            Error::Tls { message } => Error::Tls {
+                message: message.clone(),
+            },
+            Error::InvalidUrl { reason } => Error::InvalidUrl {
+                reason: reason.clone(),
+            },
+            Error::InvalidRequest { message } => Error::InvalidRequest {
+                message: message.clone(),
+            },
+            Error::Config { message } => Error::Config {
+                message: message.clone(),
+            },
+            // Anything else keeps its message but becomes a generic HTTP
+            // failure, which is a safe classification: not retryable.
+            other => Error::Http {
+                message: other.to_string(),
+                source: None,
+            },
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Constructors (crate-internal ergonomics)
+    // ------------------------------------------------------------------
+
+    pub(crate) fn bootstrap<E>(message: impl Into<String>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Error::Bootstrap {
             message: message.into(),
             source: Some(Box::new(source)),
         }
     }
 
-    /// Create a connection error
-    pub fn connection(
-        host: impl Into<String>,
-        port: u16,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::Connection {
-            host: host.into(),
+    pub(crate) fn connect<E>(host: impl Into<String>, port: u16, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Error::Connect {
+            host: Sensitive::new(host.into()),
             port,
             source: Box::new(source),
         }
     }
 
-    /// Create an HTTP error
-    pub fn http(message: impl Into<String>) -> Self {
-        Self::Http {
+    pub(crate) fn tls_handshake<E>(host: impl Into<String>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Error::TlsHandshake {
+            host: Sensitive::new(host.into()),
+            source: Box::new(source),
+        }
+    }
+
+    pub(crate) fn tls(message: impl Into<String>) -> Self {
+        Error::Tls {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn http(message: impl Into<String>) -> Self {
+        Error::Http {
             message: message.into(),
             source: None,
         }
     }
 
-    /// Create an HTTP error with source
-    pub fn http_with_source(
-        message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::Http {
+    pub(crate) fn http_source<E>(message: impl Into<String>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Error::Http {
             message: message.into(),
             source: Some(Box::new(source)),
         }
     }
 
-    /// Create a TLS handshake error
-    pub fn tls_handshake(
-        host: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        Self::TlsHandshake {
-            host: host.into(),
-            source: Box::new(source),
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
+        Error::InvalidRequest {
+            message: message.into(),
         }
     }
 
-    /// Create a timeout error
-    pub fn timeout(operation: impl Into<String>, duration: Duration) -> Self {
-        Self::Timeout {
-            operation: operation.into(),
-            duration,
-        }
-    }
-
-    /// Create an invalid URL error
-    pub fn invalid_url(url: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::InvalidUrl {
-            url: url.into(),
+    pub(crate) fn invalid_url(reason: impl Into<String>) -> Self {
+        Error::InvalidUrl {
             reason: reason.into(),
         }
     }
 
-    /// Create an I/O error
-    pub fn io(message: impl Into<String>, source: std::io::Error) -> Self {
-        Self::Io {
-            message: message.into(),
-            source,
-        }
-    }
-
-    /// Create a config error
-    pub fn config(message: impl Into<String>) -> Self {
-        Self::Config {
+    pub(crate) fn decode(message: impl Into<String>) -> Self {
+        Error::Decode {
             message: message.into(),
         }
     }
 
-    /// Returns true if this error is retryable
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Error::Connection { .. }
-                | Error::Circuit { .. }
-                | Error::Timeout { .. }
-                | Error::PoolExhausted { .. }
-        )
+    pub(crate) fn timeout(operation: &'static str, duration: Duration) -> Self {
+        Error::Timeout {
+            operation,
+            duration,
+        }
     }
 
-    /// Returns true if this is a timeout error
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, Error::Timeout { .. })
+    pub(crate) fn config(message: impl Into<String>) -> Self {
+        Error::Config {
+            message: message.into(),
+        }
     }
 
-    /// Returns true if this is a TLS-related error
-    pub fn is_tls(&self) -> bool {
-        matches!(
-            self,
-            Error::TlsHandshake { .. }
-                | Error::TlsConfig { .. }
-                | Error::CertificateVerification { .. }
-        )
+    #[cfg(feature = "server")]
+    pub(crate) fn onion(message: impl Into<String>) -> Self {
+        Error::OnionService {
+            message: message.into(),
+            source: None,
+        }
     }
-}
 
-// Conversions from common error types
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io {
-            message: err.to_string(),
-            source: err,
+    #[cfg(feature = "server")]
+    pub(crate) fn onion_source<E>(message: impl Into<String>, source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Error::OnionService {
+            message: message.into(),
+            source: Some(Box::new(source)),
         }
     }
 }
 
-impl From<http::uri::InvalidUri> for Error {
-    fn from(err: http::uri::InvalidUri) -> Self {
-        Self::InvalidUrl {
-            url: String::new(),
-            reason: err.to_string(),
-        }
+/// Carries a rendered message where the original source cannot be cloned.
+#[derive(Debug)]
+pub(crate) struct Detail(pub(crate) String);
+
+impl std::fmt::Display for Detail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-impl From<http::Error> for Error {
-    fn from(err: http::Error) -> Self {
-        Self::Http {
-            message: err.to_string(),
-            source: Some(Box::new(err)),
-        }
-    }
-}
-
-impl From<hyper::Error> for Error {
-    fn from(err: hyper::Error) -> Self {
-        Self::Http {
-            message: err.to_string(),
-            source: Some(Box::new(err)),
-        }
-    }
-}
+impl std::error::Error for Detail {}
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
-    fn test_error_is_retryable() {
-        let timeout = Error::timeout("request", Duration::from_secs(30));
-        assert!(timeout.is_retryable());
+    fn host_is_scrubbed_in_display_but_reachable_programmatically() {
+        let err = Error::Connect {
+            host: Sensitive::new("secretforum.onion".to_string()),
+            port: 80,
+            source: Box::new(std::io::Error::other("nope")),
+        };
 
-        let config = Error::config("bad config");
-        assert!(!config.is_retryable());
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("secretforum"),
+            "hostname leaked into Display: {rendered}"
+        );
+        assert_eq!(err.host(), Some("secretforum.onion"));
     }
 
     #[test]
-    fn test_error_display() {
-        let err = Error::timeout("connection", Duration::from_secs(10));
-        assert_eq!(err.to_string(), "connection timed out after 10s");
+    fn transient_failures_are_retryable() {
+        let connect = Error::connect("example.onion", 80, std::io::Error::other("x"));
+        assert!(connect.is_retryable());
+        assert!(connect.is_tor());
+
+        let config = Error::config("bad");
+        assert!(!config.is_retryable());
+        assert!(!config.is_tor());
+    }
+
+    #[test]
+    fn same_kind_preserves_classification_across_the_hyper_boundary() {
+        // hyper hands connector failures back as `&dyn Error`, so if the
+        // variant were lost here, a transient connect failure would stop being
+        // retryable and stop being recognised as a Tor error.
+        let original = Error::connect("example.onion", 80, std::io::Error::other("refused"));
+        let rebuilt = original.same_kind();
+
+        assert!(rebuilt.is_retryable());
+        assert!(rebuilt.is_tor());
+        assert_eq!(rebuilt.host(), Some("example.onion"));
+        assert!(!rebuilt.to_string().contains("example.onion"));
+    }
+
+    #[test]
+    fn same_kind_preserves_timeouts() {
+        let original = Error::timeout("Tor connect", Duration::from_secs(5));
+        let rebuilt = original.same_kind();
+
+        assert!(rebuilt.is_timeout());
+        assert!(!rebuilt.is_retryable());
+    }
+
+    #[test]
+    fn same_kind_keeps_the_underlying_detail_in_the_source() {
+        let original = Error::connect("h.onion", 80, std::io::Error::other("no route"));
+        let rebuilt = original.same_kind();
+
+        let source = std::error::Error::source(&rebuilt).expect("source preserved");
+        assert!(source.to_string().contains("no route"), "{source}");
+    }
+
+    #[test]
+    fn timeouts_are_not_retryable() {
+        let err = Error::timeout("request", Duration::from_secs(1));
+        assert!(err.is_timeout());
+        assert!(!err.is_retryable());
     }
 }

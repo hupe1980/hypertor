@@ -1,36 +1,38 @@
-"""hypertor - Best-in-class Tor HTTP client and server library."""
+"""hypertor — Tor for Python.
+
+Make HTTP requests over the Tor network, and host onion services.
+
+    import hypertor
+
+    with hypertor.Client() as client:
+        response = client.get("https://check.torproject.org/api/ip")
+        print(response.json()["IP"])
+
+See https://hupe1980.github.io/hypertor for the full documentation.
+"""
 
 from hypertor._hypertor import (
-    # Client
-    Client, 
-    AsyncClient, 
-    Response,
-    # Server (OnionApp)
-    OnionApp,
-    AppConfig,
-    Request,
-    AppResponse,
-    # Exceptions
-    HypertorError,
-    TorBootstrapError,
+    AsyncClient,
+    Client,
     ConnectionError,
+    HypertorError,
+    OnionApp,
+    Request,
+    Response,
     TimeoutError,
+    TlsError,
+    __version__,
 )
 
 __all__ = [
-    # Client
-    "Client", 
-    "AsyncClient", 
-    "Response",
-    # Server
-    "OnionApp",
-    "AppConfig", 
-    "Request",
-    "AppResponse",
-    # Exceptions
-    "HypertorError",
-    "TorBootstrapError",
+    "AsyncClient",
+    "Client",
     "ConnectionError",
+    "HypertorError",
+    "OnionApp",
+    "Request",
+    "Response",
     "TimeoutError",
+    "TlsError",
+    "__version__",
 ]
-__version__ = "0.3.0"

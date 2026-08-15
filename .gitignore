@@ -42,3 +42,6 @@ build/
 .pytest_cache/
 .ruff_cache/
 *.pyi.bak
+# Compiled Python extension modules
+*.so
+__pycache__/

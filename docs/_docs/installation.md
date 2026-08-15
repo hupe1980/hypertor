@@ -1,186 +1,110 @@
 ---
 title: "Installation"
 permalink: /docs/installation/
-excerpt: "Platform-specific installation instructions"
+toc: true
 ---
-
-Get hypertor installed on your system.
 
 ## Rust
 
-### Requirements
-
-- Rust 1.85+ (edition 2024)
-- A C compiler (for native dependencies)
-
-### Add to Cargo.toml
-
 ```toml
 [dependencies]
-hypertor = "0.4"
+hypertor = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
-### Optional Features
+Minimum supported Rust version: **1.86** (Rust 2024 edition).
+
+### Feature flags
+
+| Feature | Default | Adds |
+|---|---|---|
+| `client` | ✅ | `TorClient` and the HTTP client stack |
+| `rustls` | ✅ | TLS via rustls — identical fingerprint on every platform |
+| `native-tls` | | TLS via the operating system's stack |
+| `server` | | `OnionService` and `OnionApp` |
+| `pow` | | Equi-X proof of work (see the licensing note below) |
+| `socks` | | `SocksProxy`, a local SOCKS5 front-end |
+| `ws` | | `TorWebSocket` |
+| `python` | | the PyO3 bindings |
+| `static-sqlite` | | link SQLite statically (useful on Windows) |
 
 ```toml
-[dependencies]
-hypertor = { version = "0.3", features = [
-    "full",        # All features
-    "metrics",     # Prometheus metrics
-    "tracing",     # Distributed tracing
-    "http2",       # HTTP/2 support
-    "websocket",   # WebSocket support
-    "grpc",        # gRPC support
-] }
+# Client and onion service hosting
+hypertor = { version = "0.3", features = ["server"] }
+
+# Everything
+hypertor = { version = "0.3", features = ["full"] }
 ```
 
-### Verify Installation
+### Choosing a TLS backend
 
-```rust
-use hypertor::TorClient;
+`rustls` is the default and the right choice for almost everyone. See
+[Security]({{ site.baseurl }}/docs/security/#tls-fingerprinting) for why.
 
-#[tokio::main]
-async fn main() {
-    println!("hypertor version: {}", hypertor::VERSION);
-    
-    // Create client (bootstraps Tor)
-    let client = TorClient::new().await
-        .expect("Failed to connect to Tor");
-    
-    println!("Connected to Tor network!");
-}
+If you must use the operating system's TLS stack:
+
+```toml
+hypertor = { version = "0.3", default-features = false, features = ["client", "native-tls"] }
 ```
+
+Note that `native-tls` cannot enforce a TLS 1.3 floor and cannot negotiate ALPN, so
+`min_tls_version(Tls13)` returns an error there rather than silently downgrading, and HTTP/2 over
+TLS is unavailable.
+
+### Proof of work and licensing
+
+`pow` enables the Equi-X proof-of-work defence for onion services. It is **not** included in `full`,
+because the implementation (`equix`, `hashx`) is **LGPL-3.0-only** while hypertor itself is MIT.
+A default build — client or server — contains no copyleft code.
+
+```toml
+hypertor = { version = "0.3", features = ["server", "pow"] }
+```
+
+Calling `.proof_of_work(true)` without the feature is an error at launch, rather than a service that
+silently runs unprotected.
 
 ## Python
 
-### Requirements
-
-- Python 3.9+
-- Supported platforms: Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), Windows
-
-### Install from PyPI
-
 ```bash
-# Install the latest version
 pip install hypertor
-
-# Or with optional dependencies
-pip install hypertor[pydantic]  # For type validation
 ```
 
-### Install from Source
+Requires Python **3.10 or later**. Wheels ship for Linux, macOS and Windows on x86-64 and arm64; no
+Rust toolchain is needed to install one.
 
-For development or to get the latest features:
+### Building from source
 
 ```bash
-# Requires Rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Clone and install
 git clone https://github.com/hupe1980/hypertor
 cd hypertor
-pip install maturin
-maturin develop --release
+
+uv sync --all-extras          # or: pip install maturin pytest
+maturin develop --features python
 ```
 
-### Verify Installation
+## No Tor daemon needed
 
-```python
-import hypertor
+hypertor uses arti, a pure-Rust Tor implementation, so it speaks the Tor protocol itself. You do not
+need the C `tor` daemon, Tor Browser, or `torsocks` installed.
 
-print(f"hypertor version: {hypertor.__version__}")
+## Platform notes
 
-# Quick test
-import asyncio
-from hypertor import AsyncClient
+**Windows.** arti needs SQLite for its state store. If your system provides none, enable
+`static-sqlite`:
 
-async def test():
-    async with AsyncClient(timeout=60) as client:
-        print("Connected to Tor network!")
-
-asyncio.run(test())
+```toml
+hypertor = { version = "0.3", features = ["static-sqlite"] }
 ```
 
-## Platform Notes
+**Pluggable transports.** Bridges using `obfs4`, `snowflake` or `webtunnel` need the corresponding
+transport binary installed separately — hypertor launches it, it does not bundle it. On Debian and
+Ubuntu, `apt install obfs4proxy` provides `lyrebird`.
 
-### Linux
-
-hypertor works out of the box on most Linux distributions. For Debian/Ubuntu:
+## Verifying it works
 
 ```bash
-# Install build dependencies (if building from source)
-sudo apt-get install build-essential pkg-config libssl-dev
+cargo run --example client
 ```
 
-### macOS
-
-Works on both Intel and Apple Silicon. You may need:
-
-```bash
-# Install Xcode command line tools
-xcode-select --install
-
-# OpenSSL via Homebrew (if building from source)
-brew install openssl
-export OPENSSL_DIR=$(brew --prefix openssl)
-```
-
-### Windows
-
-Pre-built wheels are available. For building from source, install Visual Studio Build Tools and Rust.
-
-## Docker
-
-Pre-built Docker images are available:
-
-```bash
-# Pull the image
-docker pull ghcr.io/hupe1980/hypertor:latest
-
-# Run with your application
-docker run -it --rm ghcr.io/hupe1980/hypertor:latest
-```
-
-### Dockerfile Example
-
-```dockerfile
-FROM rust:1.75-slim AS builder
-
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/myapp /usr/local/bin/
-
-CMD ["myapp"]
-```
-
-## Troubleshooting
-
-### "Connection timeout" on first run
-
-Tor bootstrapping can take 30-60 seconds on first connect while downloading consensus and building circuits. This is normal.
-
-### OpenSSL not found (build from source)
-
-Set the `OPENSSL_DIR` environment variable to your OpenSSL installation path:
-
-```bash
-# macOS
-export OPENSSL_DIR=$(brew --prefix openssl)
-
-# Linux
-export OPENSSL_DIR=/usr
-```
-
-### "Permission denied" when running
-
-hypertor needs network access. Make sure your firewall isn't blocking outgoing connections to Tor directory authorities and relays.
-
-## Getting Help
-
-- [GitHub Issues](https://github.com/hupe1980/hypertor/issues) — Bug reports and feature requests
-- [GitHub Discussions](https://github.com/hupe1980/hypertor/discussions) — Questions and community help
+Should print a JSON object with `"IsTor": true`.

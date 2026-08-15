@@ -1,308 +1,180 @@
 ---
-title: "Security Features"
+title: "Security"
 permalink: /docs/security/
-excerpt: "Built-in protections for anonymity and DoS resistance"
+toc: true
 ---
 
-HyperTor includes several security features to protect both clients and services. These are enabled by default where appropriate.
+## What hypertor is, and is not
 
-## Overview
+hypertor is a layer over [arti](https://gitlab.torproject.org/tpo/core/arti) and
+[hyper](https://hyper.rs). All Tor cryptography, path selection and protocol handling is arti's; all
+HTTP framing is hyper's. hypertor supplies the seam and the ergonomics.
 
-| Feature | Purpose | Default |
-|---------|---------|---------|
-| **Vanguards-lite** | Protects guard relays from discovery | Enabled |
-| **Proof of Work** | Prevents DDoS attacks on services | Off |
-| **Traffic Padding** | Prevents traffic analysis | Configurable |
-| **Circuit Isolation** | Separates different activities | Session-based |
-| **Rate Limiting** | Controls request rates | Per-connection |
+That is deliberate. A library that reimplemented any of this would be strictly worse than the
+projects that specialise in it — and in a privacy tool, "worse" means "gets someone hurt".
 
-## Vanguards-lite
+**hypertor is not an anonymity system in its own right, and no library can be.** Tor protects the
+network path. It cannot protect you from an application that logs in with your real identity, from
+timing patterns in your own traffic, from a browser fingerprint, from a document that phones home,
+or from a compromised machine.
 
-**What it protects against:** Guard enumeration attacks that could deanonymize hidden services.
+## Design choices that protect you
 
-Tor uses "guard" relays as the first hop for all circuits. If an attacker can identify your guards, they can narrow down your location. Vanguards adds additional layers of protection.
+### DNS is never resolved locally
 
-### How It Works
+Hostnames are always handed to arti and resolved by an exit relay. A Tor integration that resolves
+locally emits a plaintext DNS query from your real IP for every host you visit — the traffic is
+tunnelled but the browsing history is not. This is the most common way a Tor integration leaks.
 
-1. **Layer 2 Guards** — A small set of relays used after the guard
-2. **Rotation Policy** — Guards rotate slowly, making enumeration expensive
-3. **Persistent Selection** — Guards persist across restarts
+The SOCKS proxy additionally rejects requests carrying a bare IP literal by default, so a client
+configured with `socks5://` instead of `socks5h://` fails loudly rather than leaking quietly.
 
-### Configuration
+### Redirects cannot replay your credentials
 
-```rust
-// Enabled by default for OnionApp
-let app = OnionApp::builder()
-    .vanguards_enabled(true)  // Default
-    .vanguards_full(false)    // Use lite mode
-    .build();
-```
+`Authorization`, `Proxy-Authorization` and `Cookie` are stripped whenever a redirect crosses an
+origin boundary. Without this, any server you talk to could bounce you to a host of its choosing and
+harvest your bearer token.
 
-In Python:
+### Onion-to-clearnet redirects are refused
 
-```python
-app = OnionApp(
-    vanguards_enabled=True,   # Default
-    vanguards_full=False      # Use lite mode
-)
-```
+A connection to a `.onion` never leaves the Tor network and is authenticated by the address itself.
+Following a redirect out to clearnet moves the next request onto a path through an exit relay — an
+untrusted party by design, which sees the destination and, absent TLS, the content.
 
-### Vanguards Modes
+hypertor refuses that transition unless you opt in with
+`RedirectPolicy::allow_onion_to_clearnet(true)`. The reverse direction, clearnet to `.onion`, is
+always allowed: that is an upgrade.
 
-| Mode | Protection | Overhead |
-|------|------------|----------|
-| **Lite** (default) | Good protection, low overhead | ~10% more circuit build time |
-| **Full** | Maximum protection | ~30% more circuit build time |
-| **Off** | No additional protection | Baseline performance |
+### Hostnames are scrubbed from errors
 
-## Proof of Work (PoW)
+Error messages end up in logs, crash reports and issue trackers. `connection to
+secretforum.onion:80 failed` is a leak. Every host in an `Error` is wrapped in
+[`safelog::Sensitive`](https://docs.rs/safelog) and renders as `[scrubbed]` unless the application
+explicitly opts in. `Error::host()` returns the real value when you need it programmatically.
 
-**What it protects against:** DDoS attacks and resource exhaustion.
+### Size limits apply to decompressed bodies
 
-When enabled, clients must solve a computational puzzle before connecting to your service. This makes attacks expensive while legitimate users pay only a small one-time cost.
+A few kilobytes of gzip can expand to gigabytes. The response limit is enforced against the
+*decompressed* output while it streams, and again against the declared `Content-Length` before any
+body is read at all. Stacked encodings such as `gzip, br` are refused rather than half-decoded.
 
-### How It Works
+### Static file serving is confined
 
-1. Client requests connection
-2. Server sends PoW challenge
-3. Client solves puzzle (requires CPU work)
-4. Server verifies solution
-5. Connection proceeds
+Request paths are rejected before touching the filesystem if they contain any traversal component,
+then canonicalised and confirmed to resolve inside the configured root. Canonicalisation resolves
+symlinks, so a link inside the directory pointing outside it is caught too.
 
-The difficulty adjusts automatically based on server load.
+### Response headers cannot be split
 
-### Configuration
+Header values containing CR or LF are refused rather than written to the socket. Otherwise a handler
+that echoes user input into a header could inject headers, or an entire second response.
 
-```rust
-let app = OnionApp::builder()
-    .pow_enabled(true)
-    .pow_target_bits(20)      // Base difficulty
-    .pow_adaptive(true)       // Auto-adjust to load
-    .pow_queue_size(100)      // Max pending challenges
-    .build();
-```
+## TLS fingerprinting
 
-In Python:
+`rustls` is the default backend, and it should stay that way.
 
-```python
-app = OnionApp(
-    pow_enabled=True,
-    pow_target_bits=20,       # Base difficulty
-    pow_adaptive=True,        # Auto-adjust to load
-    pow_queue_size=100        # Max pending challenges
-)
-```
+TLS handshakes are fingerprintable: the set and ordering of cipher suites, extensions, supported
+groups and signature algorithms differ per implementation. `native-tls` binds to whatever the host
+provides — OpenSSL on Linux, SecureTransport on macOS, SChannel on Windows — so your ClientHello
+announces your operating system to the exit relay and anyone watching it. That shrinks your
+anonymity set for no benefit.
 
-### Difficulty Levels
+With `rustls`, every hypertor user emits the same ClientHello regardless of platform.
 
-| Target Bits | Time to Solve | Use Case |
-|-------------|---------------|----------|
-| 16 | ~50ms | Light protection |
-| 20 | ~500ms | Default, balanced |
-| 24 | ~5s | High-value services |
-| 28 | ~1min | Extreme protection |
+`native-tls` also cannot enforce a TLS 1.3 floor or negotiate ALPN. hypertor returns an error for
+`min_tls_version(Tls13)` on that backend rather than silently giving you TLS 1.2 — a downgrade you
+did not agree to is worse than a failure you can see.
 
-### Client Support
+### TLS is not applied to `.onion`
 
-The `TorClient` automatically handles PoW challenges:
+Onion connections are already end-to-end encrypted and authenticated by the rendezvous protocol, and
+the address *is* the service's public key. hypertor only wraps a `.onion` target in TLS if the URL
+says `https://` explicitly.
+
+## Circuit isolation
+
+Two requests sharing a circuit exit Tor from the same relay at the same moment and are linkable by
+anyone observing it. hypertor defaults to `IsolationLevel::PerHost`, so different destinations never
+share a circuit.
+
+For activities that must not be linked *within* one host — separate accounts, separate personas —
+use explicit tokens:
 
 ```rust
-// Client automatically solves PoW if required
-let resp = client.get("http://protected-service.onion")?
-    .send().await?;
+let alice = IsolationToken::new();
+let bob = IsolationToken::new();
 ```
 
-```python
-# Client automatically solves PoW if required
-resp = await client.get("http://protected-service.onion")
-```
+Each isolation group gets its own connection pool, so an isolated request can never be handed a
+connection belonging to another group.
 
-## Traffic Padding
+`IsolationLevel::PerRequest` is the strongest and the slowest: connection reuse becomes impossible
+by construction, so every request pays a full circuit build.
 
-**What it protects against:** Traffic analysis attacks that correlate traffic patterns.
+## Onion service hardening
 
-Traffic padding adds dummy data to mask the real traffic patterns, making it harder for observers to correlate your activity.
+| Threat | Defence | arti API |
+|---|---|---|
+| Guard discovery | Vanguards | `VanguardConfigBuilder::mode` |
+| Introduction floods | Proof of work (Equi-X), `pow` feature | `enable_pow` |
+| Introduction floods | Token-bucket rate limit | `rate_limit_at_intro` |
+| Stream flooding | Per-circuit stream cap | `max_concurrent_streams_per_circuit` |
+| Unauthorised discovery | Restricted discovery | `RestrictedDiscoveryConfigBuilder` |
+| Censorship of Tor itself | Bridges and pluggable transports | `TorClientConfigBuilder::bridges` |
 
-### Configuration
+See [Onion services]({{ site.baseurl }}/docs/server/#hardening) for how to configure each.
+
+### Your state directory is key material
+
+The `.onion` address is derived from a keypair arti stores in `state_dir`. Anyone who copies that
+directory can impersonate your service, and there is no revocation mechanism. Back it up as you
+would a TLS private key, and no more widely.
+
+### Client authorisation keys
+
+hypertor accepts client public keys but will not generate keypairs for you. The secret half belongs
+on the client and must never exist on the server; an API that returned both would invite exactly
+that mistake. Clients generate their own with `arti hsc get-key`.
+
+## Censorship circumvention
+
+Where Tor's published relay addresses are blocked, connect through a bridge:
 
 ```rust
-let client = TorClient::builder()
-    .padding_enabled(true)
-    .padding_mode(PaddingMode::Normal)  // or Reduced, Maximum
-    .build().await?;
+TorClient::builder()
+    .bridge("obfs4 192.0.2.1:443 FINGERPRINT cert=... iat-mode=0")
+    .transport("obfs4", "/usr/bin/lyrebird")
+    .build()
+    .await?;
 ```
 
-In Python:
+Get bridge lines from [bridges.torproject.org](https://bridges.torproject.org). Published, shared
+bridges are the first ones a censor blocks; request your own.
 
-```python
-client = TorClient(
-    padding_enabled=True,
-    padding_mode="normal"  # or "reduced", "maximum"
-)
-```
+A bridge line naming a transport is useless without the binary that speaks it, so hypertor rejects
+that combination at build time rather than hanging until timeout with no indication of why.
 
-### Padding Modes
+## Keeping arti current
 
-| Mode | Description | Overhead |
-|------|-------------|----------|
-| `Reduced` | Minimal padding | ~5% bandwidth |
-| `Normal` | Balanced protection | ~15% bandwidth |
-| `Maximum` | Full protection | ~30% bandwidth |
+The Tor network retires obsolete protocol versions. An outdated client is both conspicuous — a
+smaller, more identifiable population — and eventually non-functional. Update hypertor when it
+tracks a new arti release.
 
-## Circuit Isolation
+hypertor 0.3 tracks **arti 0.45**.
 
-**What it protects against:** Activity correlation across different operations.
+## Reporting a vulnerability
 
-Circuit isolation ensures different activities use different Tor circuits, preventing observers from linking them together.
+Open a [security advisory](https://github.com/hupe1980/hypertor/security/advisories/new) rather than
+a public issue.
 
-### Isolation Levels
+For vulnerabilities in Tor itself or in arti, report to the
+[Tor Project](https://gitlab.torproject.org/tpo/core/arti/-/issues) — hypertor is not the right
+place, and delay costs users.
 
-```rust
-use hypertor::{TorClient, IsolationLevel};
+## Further reading
 
-let client = TorClient::builder()
-    .isolation(IsolationLevel::PerSession)  // Default
-    .build().await?;
-```
-
-| Level | Description | Use Case |
-|-------|-------------|----------|
-| `None` | All requests share circuits | Maximum performance |
-| `PerSession` | Circuits per client instance | Default, balanced |
-| `PerRequest` | Fresh circuit per request | Maximum privacy |
-| `PerHost` | Circuits per destination | Multi-service |
-
-### Custom Isolation
-
-Group related requests together while isolating from others:
-
-```rust
-use hypertor::IsolationToken;
-
-// Create isolation groups
-let session_a = IsolationToken::new();
-let session_b = IsolationToken::new();
-
-// These share a circuit
-client.get("http://a.onion")?.isolation(session_a.clone()).send().await?;
-client.get("http://a.onion/page")?.isolation(session_a.clone()).send().await?;
-
-// This uses a different circuit
-client.get("http://a.onion")?.isolation(session_b.clone()).send().await?;
-```
-
-## Rate Limiting
-
-Built-in rate limiting for services:
-
-```rust
-use hypertor::middleware::RateLimit;
-use std::time::Duration;
-
-let app = OnionApp::new();
-
-// Global rate limit: 100 requests per minute per connection
-app.middleware(RateLimit::new(100, Duration::from_secs(60)));
-
-// Per-route rate limit
-app.get("/api/expensive", expensive_handler)
-    .rate_limit(10, Duration::from_secs(60));
-```
-
-In Python:
-
-```python
-from hypertor import OnionApp, RateLimit
-from datetime import timedelta
-
-app = OnionApp()
-
-# Global rate limit
-app.use(RateLimit(requests=100, window=timedelta(minutes=1)))
-
-# Per-route rate limit
-@app.get("/api/expensive", rate_limit=RateLimit(10, timedelta(minutes=1)))
-async def expensive(request):
-    ...
-```
-
-## Security Best Practices
-
-### For Hidden Services
-
-1. **Enable Proof of Work** for public services
-2. **Use Vanguards** (enabled by default)
-3. **Set rate limits** appropriate for your use case
-4. **Persist keys** to maintain identity
-5. **Monitor connections** for anomalies
-
-```rust
-let app = OnionApp::builder()
-    .pow_enabled(true)
-    .pow_target_bits(20)
-    .vanguards_enabled(true)
-    .connection_limit(100)
-    .key_path("/secure/path/to/keys")
-    .build();
-```
-
-### For Clients
-
-1. **Use circuit isolation** for sensitive operations
-2. **Enable padding** if traffic analysis is a concern
-3. **Don't reuse client instances** for unrelated activities
-4. **Handle timeouts gracefully** — Tor can be slow
-
-```rust
-let client = TorClient::builder()
-    .isolation(IsolationLevel::PerRequest)
-    .padding_enabled(true)
-    .timeout(Duration::from_secs(60))
-    .build().await?;
-```
-
-## Security Considerations
-
-### What HyperTor Protects
-
-- ✅ IP address of client and server
-- ✅ Network observer seeing connection endpoints
-- ✅ Traffic content (encrypted)
-- ✅ Guard enumeration (with Vanguards)
-- ✅ DDoS attacks (with PoW)
-- ✅ DNS leaks (all DNS via Tor exit automatically)
-- ✅ Circuit path vulnerabilities (analysis via `circuits` module)
-
-### What HyperTor Does NOT Protect
-
-- ❌ Application-level data leaks (if you put your name in POST body)
-- ❌ Malware on your system
-- ❌ Human error in operational security
-- ❌ Compromised exit nodes (for clearnet access - use TLS)
-- ❌ Side-channel attacks on your hardware
-
-### Design Philosophy
-
-HyperTor is an HTTP client library, not a browser. Browser-level concerns like:
-
-- Canvas/WebGL fingerprinting
-- WebRTC leaks
-- Font enumeration
-- Plugin detection
-
-...do not apply to an HTTP client. DNS resolution is handled automatically via Tor exit nodes by the underlying arti library — there is no way for DNS to leak if you use `TorClient`.
-
-### Additional Recommendations
-
-1. **Keep dependencies updated** — Security vulnerabilities get patched
-2. **Use memory-safe code** — HyperTor is written in Rust with `#![forbid(unsafe_code)]`
-3. **Minimize logging** — Logs can deanonymize users
-4. **Sanitize user input** — Same as any web application
-5. **Use HTTPS in addition to Tor** — Defense in depth
-6. **Don't add identifying headers** — Avoid `X-Forwarded-For`, custom `User-Agent`
-
-## Next Steps
-
-- [TorClient Documentation](/docs/client/) — HTTP client for Tor
-- [OnionApp Documentation](/docs/server/) — Host hidden services
-- [Python Bindings](/docs/python/) — Full Python API reference
+- [Tor Project support](https://support.torproject.org/)
+- [Tor specifications](https://spec.torproject.org/)
+- [arti documentation](https://tpo.pages.torproject.net/core/arti/)
+- [Proof-of-work defence for onion services](https://blog.torproject.org/introducing-proof-of-work-defense-for-onion-services/)
+- [Vanguards specification](https://spec.torproject.org/vanguards-spec/)

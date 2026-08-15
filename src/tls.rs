@@ -1,160 +1,332 @@
-//! TLS abstraction layer
+//! TLS for clearnet targets reached through a Tor exit relay.
 //!
-//! Provides a unified interface for TLS operations regardless of the
-//! underlying TLS implementation (native-tls or rustls).
+//! # Why rustls is the default
 //!
-//! # Security Considerations
+//! TLS handshakes are fingerprintable. The set and ordering of cipher suites,
+//! extensions, supported groups and signature algorithms differ per
+//! implementation, so the TLS stack you use is visible to the exit relay and to
+//! anyone watching it.
 //!
-//! **rustls is strongly recommended** for anonymity-focused applications:
+//! `native-tls` binds to whatever the host provides — OpenSSL on Linux,
+//! SecureTransport on macOS, SChannel on Windows — so the handshake announces
+//! your operating system. With `rustls` every hypertor user emits the same
+//! ClientHello regardless of platform, which is the whole point.
 //!
-//! | Threat | native-tls | rustls |
-//! |--------|------------|--------|
-//! | TLS Fingerprinting | Different per OS | Consistent |
-//! | Compromised System CAs | Vulnerable | Controllable |
-//! | Memory Safety | C libraries | Pure Rust |
-//! | Platform Bugs | Common (esp. macOS) | Rare |
+//! # This does not apply to `.onion`
 //!
-//! The default is `rustls` to minimize fingerprinting and maximize safety.
+//! Onion connections are already end-to-end encrypted and authenticated by the
+//! rendezvous protocol, and the address is itself the service's public key.
+//! hypertor therefore does not wrap `.onion` targets in TLS unless the URL says
+//! `https://` explicitly.
+
+use std::sync::Arc;
 
 use arti_client::DataStream;
 
-use crate::config::TlsVersion;
+use crate::config::{TlsConfig, TlsVersion};
 use crate::error::{Error, Result};
 use crate::stream::TorStream;
 
-/// TLS connector configuration
-#[derive(Debug, Clone)]
-pub struct TlsConfig {
-    /// Verify server certificates
-    pub verify_certificates: bool,
-    /// Minimum TLS version
-    pub min_version: TlsVersion,
+/// ALPN protocol identifiers, most preferred first.
+#[cfg(feature = "rustls")]
+const ALPN_H2_HTTP11: &[&[u8]] = &[b"h2", b"http/1.1"];
+#[cfg(feature = "rustls")]
+const ALPN_HTTP11: &[&[u8]] = &[b"http/1.1"];
+
+/// A prepared TLS client configuration.
+///
+/// Building this is expensive — it reads and parses the entire system trust
+/// store — so it is built once per [`TorClient`](crate::TorClient) and shared by
+/// every connection. The previous behaviour, reloading the root store on each
+/// request, cost tens of milliseconds and hundreds of allocations per
+/// connection.
+#[derive(Clone)]
+pub struct TlsConnector {
+    #[cfg(feature = "rustls")]
+    inner: Arc<tokio_rustls::rustls::ClientConfig>,
+    #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+    inner: Arc<tokio_native_tls::TlsConnector>,
+    #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+    inner: std::marker::PhantomData<()>,
 }
 
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            verify_certificates: true,
-            min_version: TlsVersion::Tls12,
+impl std::fmt::Debug for TlsConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConnector").finish_non_exhaustive()
+    }
+}
+
+impl TlsConnector {
+    /// Build a connector from the given configuration.
+    ///
+    /// Fails if no TLS backend is compiled in, or if the system trust store
+    /// cannot be read while certificate verification is enabled — failing loudly
+    /// here is far better than failing on every later handshake with an opaque
+    /// "unknown issuer".
+    pub fn new(config: &TlsConfig) -> Result<Self> {
+        #[cfg(feature = "rustls")]
+        {
+            Ok(Self {
+                inner: Arc::new(build_rustls_config(config)?),
+            })
+        }
+
+        #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+        {
+            Ok(Self {
+                inner: Arc::new(build_native_tls_config(config)?),
+            })
+        }
+
+        #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+        {
+            let _ = config;
+            Err(Error::tls(
+                "no TLS backend compiled in; enable the `rustls` or `native-tls` feature",
+            ))
+        }
+    }
+
+    /// Perform a TLS handshake over an established Tor stream.
+    ///
+    /// `host` is used for SNI and certificate verification. It must be the name
+    /// from the URL, never an IP address resolved locally — resolving locally
+    /// would leak the destination outside Tor.
+    pub async fn connect(&self, stream: DataStream, host: &str) -> Result<TorStream> {
+        #[cfg(feature = "rustls")]
+        {
+            use tokio_rustls::rustls::pki_types::ServerName;
+
+            let server_name = ServerName::try_from(host.to_owned()).map_err(|_| {
+                Error::invalid_url(format!("{host} is not a valid TLS server name"))
+            })?;
+
+            let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.inner));
+            let tls = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| Error::tls_handshake(host, e))?;
+
+            Ok(TorStream::rustls(tls))
+        }
+
+        #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+        {
+            let tls = self
+                .inner
+                .connect(host, stream)
+                .await
+                .map_err(|e| Error::tls_handshake(host, e))?;
+
+            Ok(TorStream::native_tls(tls))
+        }
+
+        #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+        {
+            let _ = (stream, host);
+            Err(Error::tls("no TLS backend compiled in"))
         }
     }
 }
 
-/// Perform TLS handshake using native-tls
-#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-pub async fn wrap_tls_native(
-    stream: DataStream,
-    host: &str,
-    config: &TlsConfig,
-) -> Result<TorStream> {
-    use tokio_native_tls::TlsConnector;
-    use tokio_native_tls::native_tls::{Protocol, TlsConnector as NativeTlsConnector};
+#[cfg(feature = "rustls")]
+fn build_rustls_config(config: &TlsConfig) -> Result<tokio_rustls::rustls::ClientConfig> {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-    let mut builder = NativeTlsConnector::builder();
+    // rustls requires a process-wide crypto provider. Installing is idempotent
+    // and racing installs are harmless, so an already-installed provider (from
+    // another library in the same process) is not an error.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
-    // Set minimum protocol version
-    let min_protocol = match config.min_version {
-        TlsVersion::Tls12 => Protocol::Tlsv12,
-        TlsVersion::Tls13 => Protocol::Tlsv12, // native-tls auto-negotiates to 1.3
+    let versions: &[&tokio_rustls::rustls::SupportedProtocolVersion] = match config.min_version {
+        TlsVersion::Tls12 => tokio_rustls::rustls::ALL_VERSIONS,
+        TlsVersion::Tls13 => &[&tokio_rustls::rustls::version::TLS13],
     };
-    builder.min_protocol_version(Some(min_protocol));
 
-    // Configure certificate verification
+    let builder = ClientConfig::builder_with_protocol_versions(versions);
+
+    let mut tls = if config.verify_certificates {
+        let mut roots = RootCertStore::empty();
+        let loaded = rustls_native_certs::load_native_certs();
+
+        for cert in loaded.certs {
+            // Individual malformed certificates in a system store are common and
+            // not fatal; an empty store afterwards is.
+            let _ = roots.add(cert);
+        }
+
+        if roots.is_empty() {
+            let detail = loaded
+                .errors
+                .first()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the store contained no usable certificates".to_string());
+            return Err(Error::tls(format!(
+                "could not load any trusted root certificates from the system store: {detail}"
+            )));
+        }
+
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        // Explicitly opted into by `danger_accept_invalid_certs`.
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(danger::NoVerification::new()))
+            .with_no_client_auth()
+    };
+
+    tls.alpn_protocols = if config.alpn_h2 {
+        ALPN_H2_HTTP11
+    } else {
+        ALPN_HTTP11
+    }
+    .iter()
+    .map(|p| p.to_vec())
+    .collect();
+
+    Ok(tls)
+}
+
+/// Certificate verification bypass, reachable only through
+/// [`ConfigBuilder::danger_accept_invalid_certs`](crate::ConfigBuilder::danger_accept_invalid_certs).
+#[cfg(feature = "rustls")]
+mod danger {
+    use tokio_rustls::rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use tokio_rustls::rustls::crypto::{
+        CryptoProvider, verify_tls12_signature, verify_tls13_signature,
+    };
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_rustls::rustls::{DigitallySignedStruct, Error, SignatureScheme};
+
+    #[derive(Debug)]
+    pub(super) struct NoVerification(CryptoProvider);
+
+    impl NoVerification {
+        pub(super) fn new() -> Self {
+            Self(tokio_rustls::rustls::crypto::ring::default_provider())
+        }
+    }
+
+    impl ServerCertVerifier for NoVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+}
+
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+fn build_native_tls_config(config: &TlsConfig) -> Result<tokio_native_tls::TlsConnector> {
+    use tokio_native_tls::native_tls::{Protocol, TlsConnector as NativeConnector};
+
+    let mut builder = NativeConnector::builder();
+
+    // native-tls exposes no TLS 1.3 floor. Silently accepting 1.2 when the
+    // caller asked for 1.3 would be a downgrade they never agreed to, so refuse.
+    match config.min_version {
+        TlsVersion::Tls12 => {
+            builder.min_protocol_version(Some(Protocol::Tlsv12));
+        }
+        TlsVersion::Tls13 => {
+            return Err(Error::tls(
+                "the native-tls backend cannot enforce a TLS 1.3 floor; \
+                 build with the `rustls` feature to require TLS 1.3",
+            ));
+        }
+    }
+
     if !config.verify_certificates {
         builder.danger_accept_invalid_certs(true);
         builder.danger_accept_invalid_hostnames(true);
     }
 
-    let connector = builder.build().map_err(|e| Error::TlsConfig {
-        message: e.to_string(),
-    })?;
+    // native-tls offers no ALPN control, so HTTP/2 over TLS is unavailable here.
+    let connector = builder
+        .build()
+        .map_err(|e| Error::tls(format!("could not build native-tls connector: {e}")))?;
 
-    let connector = TlsConnector::from(connector);
-
-    // Add timeout to TLS handshake - Tor streams can be slow
-    let tls_handshake = connector.connect(host, stream);
-    let tls_stream = tokio::time::timeout(std::time::Duration::from_secs(30), tls_handshake)
-        .await
-        .map_err(|_| Error::TlsConfig {
-            message: format!("TLS handshake timed out for {}", host),
-        })?
-        .map_err(|e| Error::tls_handshake(host, e))?;
-
-    Ok(TorStream::native_tls(tls_stream))
+    Ok(tokio_native_tls::TlsConnector::from(connector))
 }
 
-/// Perform TLS handshake using rustls
-#[cfg(feature = "rustls")]
-pub async fn wrap_tls_rustls(
-    stream: DataStream,
-    host: &str,
-    _config: &TlsConfig,
-) -> Result<TorStream> {
-    use std::sync::Arc;
-    use tokio_rustls::TlsConnector;
-    use tokio_rustls::rustls::ClientConfig;
-    use tokio_rustls::rustls::RootCertStore;
-    use tokio_rustls::rustls::crypto::ring::default_provider;
-    use tokio_rustls::rustls::pki_types::ServerName;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Install the ring crypto provider (safe to call multiple times - it's idempotent)
-    let _ = default_provider().install_default();
-
-    // Load native root certificates
-    let mut root_store = RootCertStore::empty();
-    let certs_result = rustls_native_certs::load_native_certs();
-    for cert in certs_result.certs {
-        let _ = root_store.add(cert);
-    }
-
-    // Create rustls config
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = TlsConnector::from(Arc::new(config));
-
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| Error::invalid_url(host, "invalid hostname for TLS"))?;
-
-    // Add timeout to TLS handshake
-    let tls_handshake = connector.connect(server_name, stream);
-    let tls_stream = tokio::time::timeout(std::time::Duration::from_secs(30), tls_handshake)
-        .await
-        .map_err(|_| Error::TlsConfig {
-            message: format!("TLS handshake timed out for {}", host),
-        })?
-        .map_err(|e| Error::tls_handshake(host, e))?;
-
-    Ok(TorStream::rustls(tls_stream))
-}
-
-/// Wrap a stream in TLS using the configured backend
-///
-/// # Backend Priority
-///
-/// If both backends are enabled, **rustls takes priority** for security:
-/// - Consistent TLS fingerprint across all platforms
-/// - Pure Rust implementation (memory-safe)
-/// - Not affected by system CA store compromise
-pub async fn wrap_tls(stream: DataStream, host: &str, config: &TlsConfig) -> Result<TorStream> {
-    // SECURITY: Prefer rustls over native-tls when both are enabled
-    // rustls provides consistent fingerprinting and is memory-safe
+    #[test]
     #[cfg(feature = "rustls")]
-    {
-        return wrap_tls_rustls(stream, host, config).await;
+    fn connector_builds_from_the_system_trust_store() {
+        let connector = TlsConnector::new(&TlsConfig::default());
+        assert!(
+            connector.is_ok(),
+            "default TLS config must build: {:?}",
+            connector.err()
+        );
     }
 
+    #[test]
+    #[cfg(feature = "rustls")]
+    fn alpn_advertises_h2_only_when_enabled() {
+        let with_h2 = build_rustls_config(&TlsConfig::default()).expect("builds");
+        assert_eq!(
+            with_h2.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+
+        let config = TlsConfig {
+            alpn_h2: false,
+            ..Default::default()
+        };
+        let without = build_rustls_config(&config).expect("builds");
+        assert_eq!(without.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
     #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-    {
-        return wrap_tls_native(stream, host, config).await;
-    }
-
-    #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-    {
-        let _ = (stream, host, config);
-        Err(Error::TlsConfig {
-            message: "No TLS backend enabled. Enable 'native-tls' or 'rustls' feature.".to_string(),
-        })
+    fn native_tls_refuses_to_pretend_it_can_enforce_tls13() {
+        let config = TlsConfig {
+            min_version: TlsVersion::Tls13,
+            ..Default::default()
+        };
+        assert!(TlsConnector::new(&config).is_err());
     }
 }

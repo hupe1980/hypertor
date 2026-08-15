@@ -1,50 +1,103 @@
-//! Stream isolation for Tor circuits
+//! Circuit isolation.
 //!
-//! Stream isolation ensures different activities use different Tor circuits,
-//! preventing correlation attacks that could link your actions together.
+//! Two requests that travel over the same Tor circuit leave the network from
+//! the same exit relay at the same time. Anyone watching that exit can link
+//! them. Isolation is how you decide which of your activities are allowed to be
+//! linked to each other.
+//!
+//! ```rust,no_run
+//! use hypertor::{IsolationToken, TorClient};
+//!
+//! # async fn demo() -> hypertor::Result<()> {
+//! let client = TorClient::new().await?;
+//!
+//! // Two personas that must never share an exit relay.
+//! let alice = IsolationToken::new();
+//! let bob = IsolationToken::new();
+//!
+//! client.get("http://forum.onion/inbox")?.isolation(alice).send().await?;
+//! client.get("http://forum.onion/profile")?.isolation(alice).send().await?;
+//! client.get("http://shop.onion/cart")?.isolation(bob).send().await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Global counter for generating unique isolation tokens
-static ISOLATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+use arti_client::IsolationToken as ArtiToken;
 
-/// Stream isolation level
+/// Distinguishes tokens for hashing.
 ///
-/// Determines how Tor circuits are shared between requests.
+/// arti's own `IsolationToken` is deliberately opaque and implements neither
+/// `Hash` nor `Ord`, so hypertor carries its own id alongside it to key the
+/// per-isolation connection pools.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// How circuits are shared between requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum IsolationLevel {
-    /// No isolation - all requests share circuits (fastest, least private)
-    #[default]
+    /// Share circuits freely. Fastest, and the weakest separation.
+    ///
+    /// Note that arti still isolates by target port and by the client's own
+    /// rules; this only means hypertor adds no isolation of its own.
     None,
-    /// Isolate by destination host (requests to different hosts use different circuits)
-    ByHost,
-    /// Isolate per request (each request gets a new circuit - slowest, most private)
+
+    /// One circuit family per destination host.
+    ///
+    /// A sensible default: requests to `a.onion` never share an exit with
+    /// requests to `b.onion`, while repeated requests to the same host reuse a
+    /// warm circuit.
+    #[default]
+    PerHost,
+
+    /// A brand-new circuit for every single request.
+    ///
+    /// The strongest separation and by far the slowest: each request pays the
+    /// full circuit build cost (typically seconds), and connection reuse is
+    /// impossible by construction.
     PerRequest,
-    /// Custom isolation token (requests with same token share a circuit)
-    Token(IsolationToken),
+
+    /// Use one explicit [`IsolationToken`] for everything.
+    Fixed(IsolationToken),
 }
 
-/// Unique token for custom stream isolation
+/// A handle identifying one circuit-sharing group.
 ///
-/// Requests with the same token will share a Tor circuit.
-/// Different tokens guarantee different circuits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IsolationToken(u64);
+/// Requests carrying equal tokens may share a circuit; requests carrying
+/// different tokens never do. Tokens are cheap to copy and are only meaningful
+/// within one process.
+#[derive(Debug, Clone, Copy)]
+pub struct IsolationToken {
+    id: u64,
+    inner: ArtiToken,
+}
 
 impl IsolationToken {
-    /// Create a new unique isolation token
+    /// Create a token that is distinct from every other token.
     pub fn new() -> Self {
-        Self(ISOLATION_COUNTER.fetch_add(1, Ordering::Relaxed))
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            inner: ArtiToken::new(),
+        }
     }
 
-    /// Create a token from a raw value (for testing)
-    pub fn from_raw(value: u64) -> Self {
-        Self(value)
+    pub(crate) fn inner(self) -> ArtiToken {
+        self.inner
     }
+}
 
-    /// Get the raw token value
-    pub fn as_raw(&self) -> u64 {
-        self.0
+impl PartialEq for IsolationToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for IsolationToken {}
+
+impl std::hash::Hash for IsolationToken {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
     }
 }
 
@@ -54,86 +107,60 @@ impl Default for IsolationToken {
     }
 }
 
-/// A session with its own isolation token
+impl From<IsolationToken> for ArtiToken {
+    fn from(token: IsolationToken) -> Self {
+        token.inner
+    }
+}
+
+/// A group of requests that share one circuit, isolated from everything else.
 ///
-/// All requests made through an isolated session share the same Tor circuit,
-/// but use a different circuit from other sessions.
-#[derive(Debug, Clone)]
+/// A session is just a named [`IsolationToken`]; it holds no connection state
+/// and can be cloned freely across tasks.
+#[derive(Debug, Clone, Default)]
 pub struct IsolatedSession {
     token: IsolationToken,
 }
 
 impl IsolatedSession {
-    /// Create a new isolated session
+    /// Start a new isolated session.
     pub fn new() -> Self {
-        Self {
-            token: IsolationToken::new(),
-        }
+        Self::default()
     }
 
-    /// Get the isolation token for this session
+    /// The token backing this session.
     pub fn token(&self) -> IsolationToken {
         self.token
     }
 }
 
-impl Default for IsolatedSession {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Compute isolation token based on level and request info
-pub fn compute_isolation(level: IsolationLevel, host: Option<&str>) -> Option<IsolationToken> {
-    match level {
-        IsolationLevel::None => None,
-        IsolationLevel::ByHost => {
-            // Hash the host to create a deterministic token
-            host.map(|h| {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                h.hash(&mut hasher);
-                IsolationToken::from_raw(hasher.finish())
-            })
-        }
-        IsolationLevel::PerRequest => Some(IsolationToken::new()),
-        IsolationLevel::Token(token) => Some(token),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
-    fn test_token_uniqueness() {
-        let t1 = IsolationToken::new();
-        let t2 = IsolationToken::new();
-        assert_ne!(t1, t2);
+    fn tokens_are_unique() {
+        assert_ne!(IsolationToken::new(), IsolationToken::new());
     }
 
     #[test]
-    fn test_compute_isolation_none() {
-        let token = compute_isolation(IsolationLevel::None, Some("example.com"));
-        assert!(token.is_none());
+    fn tokens_are_stable_when_copied() {
+        let token = IsolationToken::new();
+        assert_eq!(token, token);
     }
 
     #[test]
-    fn test_compute_isolation_by_host() {
-        let t1 = compute_isolation(IsolationLevel::ByHost, Some("example.com"));
-        let t2 = compute_isolation(IsolationLevel::ByHost, Some("example.com"));
-        let t3 = compute_isolation(IsolationLevel::ByHost, Some("other.com"));
-
-        assert_eq!(t1, t2); // Same host = same token
-        assert_ne!(t1, t3); // Different host = different token
+    fn sessions_do_not_collide() {
+        assert_ne!(
+            IsolatedSession::new().token(),
+            IsolatedSession::new().token()
+        );
     }
 
     #[test]
-    fn test_compute_isolation_per_request() {
-        let t1 = compute_isolation(IsolationLevel::PerRequest, Some("example.com"));
-        let t2 = compute_isolation(IsolationLevel::PerRequest, Some("example.com"));
-
-        assert_ne!(t1, t2); // Always different
+    fn default_level_isolates_per_host() {
+        // A default that shares circuits across every destination would silently
+        // link a user's activities; assert the safer default stays put.
+        assert_eq!(IsolationLevel::default(), IsolationLevel::PerHost);
     }
 }

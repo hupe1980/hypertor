@@ -1,6 +1,5 @@
 # cargo-deny configuration for hypertor
 # https://embarkstudios.github.io/cargo-deny/
-# NOTE: License checks disabled in CI due to upstream crate license volatility
 
 # ============================================================================
 # Advisories - Check for known security vulnerabilities
@@ -10,14 +9,65 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 # Ignore advisories for unmaintained crates that are transitive dependencies
 # and have no security vulnerabilities (just maintenance status notices)
+# Every entry must say what the exposure is and why it is tolerable. An
+# unexplained ignore is how a real vulnerability gets waved through.
 ignore = [
-    "RUSTSEC-2024-0436",  # paste - unmaintained but no security issues, transitive from arti
-    # NOTE: The following is a known vulnerability in a transitive dependency.
-    # We document it here but cannot fix it as it comes from arti's dependency tree.
-    # The Marvin Attack requires network timing analysis and is mitigated by Tor's
-    # inherent network latency variability.
-    "RUSTSEC-2023-0071",  # rsa - Marvin Attack timing sidechannel, transitive from arti TLS
+    # RUSTSEC-2024-0436 — `paste` is unmaintained.
+    #
+    # A maintenance-status notice, not a vulnerability: `paste` is a proc-macro
+    # that concatenates identifiers at compile time and ships no runtime code.
+    # It reaches us transitively through arti.
+    "RUSTSEC-2024-0436",
+
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing side-channel in `rsa` 0.9.
+    #
+    # Reached only via arti's `ssh-key-fork-arti` -> `tor-key-forge` path, which
+    # uses it for the OpenSSH key *format* that arti's key store is written in.
+    # hypertor never performs RSA decryption or signing with attacker-supplied
+    # ciphertext: onion service and client authorisation keys are ed25519 and
+    # x25519, and TLS is handled by rustls, not by this crate.
+    #
+    # There is no fixed release of `rsa` 0.9 to move to. Revisit when arti
+    # upgrades its ssh-key dependency.
+    "RUSTSEC-2023-0071",
 ]
+
+# ============================================================================
+# Licenses — every dependency must carry a permissive license compatible with
+# shipping hypertor under MIT.
+# ============================================================================
+[licenses]
+version = 2
+# A copyleft license appearing here would be a real problem for downstream
+# users, so this is an allow-list rather than a deny-list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "MPL-2.0",          # file-level copyleft; linking is unaffected
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+
+# LGPL-3.0 enters the tree only through arti's Equi-X proof-of-work crates
+# (`equix`, `hashx`), which hypertor gates behind the opt-in `pow` feature.
+# A default build carries no copyleft code; allowing it here would hide that
+# distinction, so it is deliberately absent from the list above.
+confidence-threshold = 0.9
+
+# `ring` ships a bespoke license file combining ISC, MIT and OpenSSL terms.
+[[licenses.clarify]]
+crate = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 # ============================================================================
 # Bans - Disallow certain crates

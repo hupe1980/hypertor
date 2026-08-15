@@ -1,318 +1,186 @@
 ---
-title: "Python Bindings"
+title: "Python"
 permalink: /docs/python/
-excerpt: "Full Python API via PyO3"
+toc: true
 ---
-
-HyperTor provides native Python bindings via PyO3/Maturin, giving you the full power of the Rust library with Pythonic ergonomics.
-
-## Installation
 
 ```bash
 pip install hypertor
 ```
 
-Or build from source:
+Requires Python 3.10 or later. Wheels ship for Linux, macOS and Windows; no Rust toolchain needed.
 
-```bash
-uv venv && source .venv/bin/activate
-uv pip install maturin
-maturin develop
+## Client
+
+```python
+import hypertor
+
+with hypertor.Client() as client:
+    response = client.get("https://check.torproject.org/api/ip")
+    response.raise_for_status()
+    print(response.json())
 ```
 
-## AsyncClient
+Constructing a `Client` bootstraps Tor, which takes tens of seconds on a cold cache. **Create one
+and reuse it** rather than one per request.
 
-The main HTTP client for making requests over Tor.
+```python
+client = hypertor.Client(
+    timeout=60.0,            # seconds, covers the whole request
+    max_idle_per_host=4,     # pooled connections kept warm
+    isolation="per_host",    # "none" | "per_host" | "per_request"
+    user_agent=None,         # defaults to Tor Browser's
+    verify=True,             # TLS certificate verification
+)
+```
 
-### Basic Usage
+### Requests
+
+```python
+client.get(url, params={"q": "rust"}, headers={"X-Custom": "value"}, timeout=30.0)
+
+client.post(url, json={"name": "Alice"})       # serialised with json.dumps
+client.post(url, data={"field": "value"})      # form-urlencoded
+client.post(url, body=b"raw bytes")
+
+client.put(url, json={...})
+client.delete(url)
+```
+
+`json=` is serialised by Python's own `json` module, so custom encoders and anything `json.dumps`
+handles keep working.
+
+### Responses
+
+```python
+response.status_code    # int
+response.ok             # bool, 2xx
+response.headers        # dict[str, str], lowercased
+response.text           # str
+response.content        # bytes
+response.json()         # parsed with Python's json module
+response.raise_for_status()
+len(response)           # body length in bytes
+```
+
+## Async
 
 ```python
 import asyncio
-from hypertor import AsyncClient
+import hypertor
 
 async def main():
-    async with AsyncClient(timeout=60) as client:
-        # GET request
-        resp = await client.get("https://check.torproject.org/api/ip")
-        print(f"Status: {resp.status_code}")
-        print(f"Body: {resp.text()}")
+    async with hypertor.AsyncClient() as client:
+        # Concurrent, over separate circuits.
+        responses = await asyncio.gather(
+            client.get("http://a.onion/"),
+            client.get("http://b.onion/"),
+        )
+        for response in responses:
+            print(response.status_code)
 
 asyncio.run(main())
 ```
 
-### Constructor
+## The GIL
+
+Every network call releases the GIL for its duration, so a request that takes 30 seconds does not
+freeze the rest of your program. Threads and asyncio tasks keep running normally.
+
+## Onion services
 
 ```python
-AsyncClient(timeout=30)
-```
+import hypertor
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `timeout` | `int` | 30 | Request timeout in seconds |
+# state_dir keeps the .onion address stable across restarts.
+app = hypertor.OnionApp("my-service", state_dir="./onion-state")
 
-### HTTP Methods
-
-```python
-async with AsyncClient(timeout=60) as client:
-    # GET
-    resp = await client.get("https://example.com")
-    
-    # POST with JSON (note: json is a string)
-    resp = await client.post(
-        "https://httpbin.org/post",
-        json='{"key": "value"}'
-    )
-    
-    # POST with form data
-    resp = await client.post(
-        "https://httpbin.org/post",
-        data="field=value&other=data"
-    )
-```
-
-### Response Object
-
-```python
-resp = await client.get("https://example.com")
-
-# Status code (int)
-resp.status_code  # 200
-
-# Body as text (method)
-resp.text()  # "<!DOCTYPE html>..."
-
-# Body as JSON (method)
-resp.json()  # {"key": "value"}
-
-# Response headers (dict)
-resp.headers  # {"content-type": "application/json", ...}
-```
-
-## Error Handling
-
-```python
-from hypertor import (
-    AsyncClient,
-    HypertorError,     # Base exception for all errors
-    TorBootstrapError, # Failed to connect to Tor network
-    ConnectionError,   # Connection failed
-    TimeoutError,      # Request timed out
-)
-
-async def safe_request():
-    try:
-        async with AsyncClient(timeout=60) as client:
-            resp = await client.get("http://example.onion")
-            return resp.json()
-    except TimeoutError:
-        print("Request timed out - Tor can be slow")
-    except ConnectionError:
-        print("Failed to connect")
-    except TorBootstrapError:
-        print("Could not connect to Tor network")
-    except HypertorError as e:
-        print(f"General error: {e}")
-```
-
-## OnionApp
-
-FastAPI-like framework for hosting .onion services.
-
-### Basic Usage
-
-```python
-from hypertor import OnionApp
-
-app = OnionApp()
 
 @app.get("/")
-async def home():
-    return {"message": "Welcome to my .onion service!"}
-
-@app.get("/api/info")
-async def info():
-    return {"version": "1.0", "anonymous": True}
-
-@app.post("/api/echo")
-async def echo(request):
-    body = await request.json()
-    return {"echoed": body}
-
-# Run the service
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(app.run())
-```
-
-### Route Decorators
-
-```python
-@app.get("/path")      # GET requests
-@app.post("/path")     # POST requests
-@app.put("/path")      # PUT requests
-@app.delete("/path")   # DELETE requests
-```
-
-### Request Handling
-
-```python
-@app.post("/api/data")
-async def handle_data(request):
-    # Get JSON body
-    body = await request.json()
-    
-    # Access request info
-    print(request.method)  # "POST"
-    print(request.path)    # "/api/data"
-    
-    return {"received": body}
-```
-
-### Response Types
-
-```python
-@app.get("/text")
-async def text_response():
-    return "Plain text response"
-
-@app.get("/json")
-async def json_response():
-    return {"key": "value"}  # Automatically serialized
-
-@app.get("/status")
-async def custom_status():
-    return {"error": "Not found"}, 404  # Tuple with status code
-```
-
-### Middleware
-
-```python
-@app.middleware
-async def log_requests(request, call_next):
-    print(f"→ {request.method} {request.path}")
-    response = await call_next(request)
-    print(f"← {response.status_code}")
-    return response
-```
-
-## Sync Client
-
-For non-async code, use the synchronous client:
-
-```python
-from hypertor import Client
-
-with Client(timeout=60) as client:
-    resp = client.get("https://check.torproject.org/api/ip")
-    print(resp.json())
-```
-
-## Complete Example: Secure API Client
-
-```python
-#!/usr/bin/env python3
-"""Production-ready Tor API client with resilience patterns."""
-
-from hypertor import AsyncClient, TimeoutError, HypertorError
-import asyncio
-import time
+def home(request):
+    return "<h1>hello from .onion</h1>"
 
 
-class SecureClient:
-    """Tor client with retry and circuit breaker."""
-    
-    def __init__(self, base_url: str, max_retries: int = 3):
-        self.base_url = base_url.rstrip("/")
-        self.max_retries = max_retries
-        self._client = None
-        self._failures = 0
-        self._circuit_open = False
-    
-    async def __aenter__(self):
-        self._client = await AsyncClient(timeout=60).__aenter__()
-        return self
-    
-    async def __aexit__(self, *args):
-        if self._client:
-            await self._client.__aexit__(*args)
-    
-    async def get(self, endpoint: str) -> dict:
-        """GET with automatic retry."""
-        if self._circuit_open:
-            raise HypertorError("Circuit breaker open")
-        
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        
-        for attempt in range(self.max_retries):
-            try:
-                resp = await self._client.get(url)
-                self._failures = 0
-                return resp.json()
-            except TimeoutError:
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                self._failures += 1
-                if self._failures >= 5:
-                    self._circuit_open = True
-                raise
+@app.get("/health")
+def health(request):
+    return {"status": "ok"}          # dicts and lists become JSON
 
 
-async def main():
-    async with SecureClient("https://httpbin.org") as client:
-        data = await client.get("/ip")
-        print(f"IP: {data}")
+@app.get("/users/{user_id}")
+def get_user(request):
+    return {"id": request.params["user_id"]}
+
+
+@app.post("/echo")
+def echo(request):
+    return {"received": request.json()}
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run()   # prints the .onion address, then serves
 ```
 
-## API Reference Summary
+Handlers may be `def` or `async def`. Return values are converted as follows:
 
-### Exports
+| Returned | Response |
+|---|---|
+| `str` | `text/plain` |
+| `dict`, `list` | `application/json` |
+| `bytes` | raw body |
+| anything else | `str(value)` as `text/plain` |
+
+### Request object
 
 ```python
-from hypertor import (
-    # Clients
-    AsyncClient,       # Async HTTP client
-    Client,            # Sync HTTP client
-    Response,          # Response object
-    
-    # Server
-    OnionApp,          # FastAPI-like app
-    AppConfig,         # App configuration
-    Request,           # Incoming request
-    AppResponse,       # Outgoing response
-    
-    # Exceptions
-    HypertorError,     # Base exception
-    TorBootstrapError, # Bootstrap failed
-    ConnectionError,   # Connection error
-    TimeoutError,      # Timeout error
-)
+request.method     # str
+request.path       # str
+request.query      # dict[str, str]
+request.params     # dict[str, str], from the route pattern
+request.headers    # dict[str, str]
+request.body       # bytes
+request.text()     # str
+request.json()     # parsed JSON
 ```
 
-### Type Hints
+## Errors
 
 ```python
-from hypertor import AsyncClient, Response
+import hypertor
 
-async def fetch(url: str) -> dict:
-    async with AsyncClient(timeout=60) as client:
-        resp: Response = await client.get(url)
-        return resp.json()
+try:
+    response = client.get("http://unreachable.onion/")
+except hypertor.TimeoutError:
+    ...
+except hypertor.ConnectionError:       # bootstrap or connect failure
+    ...
+except hypertor.TlsError:
+    ...
+except hypertor.HypertorError:         # catches all of the above
+    ...
 ```
 
-## Notes
+Note that `hypertor.ConnectionError` and `hypertor.TimeoutError` shadow the builtins of the same
+name inside a `from hypertor import *`; prefer the qualified form.
 
-1. **Tor Bootstrap**: First connection takes 30-60 seconds as Tor builds circuits
-2. **Request Latency**: Expect 5-30 seconds per request due to Tor's onion routing
-3. **JSON Strings**: The `json` parameter takes a string, not a dict
-4. **Circuit Isolation**: Each `AsyncClient` instance has its own Tor circuits
+## Type hints
 
-## See Also
+The package ships `py.typed` and complete stubs, so mypy and pyright check your usage:
 
-- [Python Examples](https://github.com/hupe1980/hypertor/tree/main/python_examples)
-- [Rust TorClient](/docs/client/) - Full API with advanced features
-- [Rust OnionApp](/docs/server/) - Full server API
+```python
+from hypertor import Client, Response
+
+def fetch(client: Client, url: str) -> Response:
+    return client.get(url)
+```
+
+## Building from source
+
+```bash
+git clone https://github.com/hupe1980/hypertor
+cd hypertor
+uv sync --all-extras
+maturin develop --features python
+
+pytest                # offline tests
+pytest -m network     # includes tests needing a live Tor connection
+```

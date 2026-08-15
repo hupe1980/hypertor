@@ -1,177 +1,62 @@
-//! Onion Service Example - Host a .onion website
+//! Hosting an onion service.
 //!
-//! This example demonstrates how to create and run an anonymous
-//! web service as a Tor onion (hidden service).
+//! ```console
+//! $ cargo run --example onion_service --features server
+//! ```
 //!
-//! Run with: cargo run --example onion_service --features server
+//! Proof-of-work needs the `pow` feature, which pulls in LGPL-3.0 dependencies
+//! and is therefore opt-in:
+//!
+//! ```console
+//! $ cargo run --example onion_service --features "server,pow"
+//! ```
 
-use hypertor::{OnionApp, OnionAppConfig, Result, ServeRequest, ServeResponse};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-// =============================================================================
-// Data Models
-// =============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Message {
-    content: String,
-    #[serde(default = "default_sender")]
-    sender: String,
-}
-
-fn default_sender() -> String {
-    "anonymous".to_string()
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ServiceInfo {
-    name: &'static str,
-    version: &'static str,
-    anonymous: bool,
-    powered_by: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct HealthStatus {
-    status: &'static str,
-    tor_connected: bool,
-    request_count: usize,
-}
-
-// =============================================================================
-// Shared State
-// =============================================================================
-
-struct AppState {
-    messages: parking_lot::Mutex<Vec<Message>>,
-    request_count: AtomicUsize,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            messages: parking_lot::Mutex::new(Vec::new()),
-            request_count: AtomicUsize::new(0),
-        }
-    }
-}
-
-// =============================================================================
-// Main
-// =============================================================================
+use hypertor::{OnionApp, OnionService, ServeResponse};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+async fn main() -> hypertor::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter("hypertor=info")
+        .init();
 
-    println!("🧅 hypertor - Onion Service Example");
-    println!("====================================");
-    println!();
-
-    // Create shared state
-    let state = Arc::new(AppState::default());
-
-    // Clone state for closures
-    let state_health = Arc::clone(&state);
-    let state_list = Arc::clone(&state);
-    let state_create = Arc::clone(&state);
-
-    // Build the OnionApp
-    let config = OnionAppConfig::default();
-
-    let app = OnionApp::with_config(config)
-        // Root endpoint
-        .get("/", |_req: ServeRequest| async {
-            ServeResponse::json(&serde_json::json!({
-                "service": "hypertor-example",
-                "message": "Welcome to my anonymous onion service! 🧅",
-                "endpoints": ["/", "/api/info", "/api/health", "/api/messages"]
-            }))
-            .unwrap_or_else(|_| ServeResponse::internal_error("JSON error"))
+    let app = OnionApp::new()
+        .get("/", |_req| async {
+            ServeResponse::html("<h1>Hello from a .onion service</h1>")
         })
-        // Service info
-        .get("/api/info", |_req: ServeRequest| async {
-            ServeResponse::json(&ServiceInfo {
-                name: "HyperTor Example Service",
-                version: "1.0.0",
-                anonymous: true,
-                powered_by: "hypertor",
-            })
-            .unwrap_or_else(|_| ServeResponse::internal_error("JSON error"))
+        .get("/health", |_req| async {
+            ServeResponse::json(&serde_json::json!({"status": "ok"}))
         })
-        // Health check
-        .get("/api/health", move |_req: ServeRequest| {
-            let state = Arc::clone(&state_health);
-            async move {
-                let count = state.request_count.fetch_add(1, Ordering::Relaxed);
-                ServeResponse::json(&HealthStatus {
-                    status: "healthy",
-                    tor_connected: true,
-                    request_count: count,
-                })
-                .unwrap_or_else(|_| ServeResponse::internal_error("JSON error"))
-            }
+        .get("/users/{id}", |req| async move {
+            let id = req.param("id").unwrap_or("unknown").to_string();
+            ServeResponse::json(&serde_json::json!({"id": id}))
         })
-        // Echo endpoint
-        .post("/api/echo", |req: ServeRequest| async move {
-            match req.json::<serde_json::Value>() {
-                Ok(data) => ServeResponse::json(&serde_json::json!({
-                    "echoed": data,
-                    "message": "Your data was received anonymously!"
-                }))
-                .unwrap_or_else(|_| ServeResponse::internal_error("JSON error")),
-                Err(_) => ServeResponse::new(400).with_body("Invalid JSON body"),
-            }
-        })
-        // List messages
-        .get("/api/messages", move |_req: ServeRequest| {
-            let state = Arc::clone(&state_list);
-            async move {
-                let messages = state.messages.lock();
-                ServeResponse::json(&serde_json::json!({
-                    "count": messages.len(),
-                    "messages": *messages
-                }))
-                .unwrap_or_else(|_| ServeResponse::internal_error("JSON error"))
-            }
-        })
-        // Create message
-        .post("/api/messages", move |req: ServeRequest| {
-            let state = Arc::clone(&state_create);
-            async move {
-                match req.json::<Message>() {
-                    Ok(message) => {
-                        let mut messages = state.messages.lock();
-                        messages.push(message.clone());
-                        ServeResponse::json(&serde_json::json!({
-                            "success": true,
-                            "message": "Message created",
-                            "data": message
-                        }))
-                        .unwrap_or_else(|_| ServeResponse::internal_error("JSON error"))
-                    }
-                    Err(_) => ServeResponse::new(400).with_body("Invalid JSON body"),
+        .post("/echo", |req| async move {
+            match req.text() {
+                Ok(body) => ServeResponse::json(&serde_json::json!({"received": body})),
+                Err(e) => {
+                    ServeResponse::status(http::StatusCode::BAD_REQUEST).with_body(e.to_string())
                 }
             }
         });
 
-    println!("Starting onion service...");
-    println!();
-    println!("This will:");
-    println!("  1. Connect to the Tor network");
-    println!("  2. Create an onion service");
-    println!("  3. Print your .onion address");
-    println!("  4. Start accepting connections");
-    println!();
-    println!("Press Ctrl+C to stop.");
-    println!();
+    // `state_dir` is what keeps the .onion address stable across restarts:
+    // the address is derived from a key arti stores there. Without it you get a
+    // brand-new address every time.
+    let service = OnionService::builder()
+        .nickname("hypertor-example")?
+        .state_dir("./onion-state")
+        // Proof-of-work only engages under load, so it costs ordinary clients
+        // nothing while raising the price of an introduction flood. Requires
+        // the `pow` feature.
+        .proof_of_work(cfg!(feature = "pow"))
+        .launch()
+        .await?;
 
-    // Run the service
-    // This will print the .onion address once ready
-    app.run().await?;
+    let serving = app.serve_on(service).await?;
 
-    Ok(())
+    println!("\n  🧅 {}\n", serving.onion_address());
+    println!("  reach it with:");
+    println!("    torsocks curl http://{}/", serving.onion_address());
+
+    serving.wait().await
 }

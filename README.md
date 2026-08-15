@@ -1,6 +1,6 @@
 # 🧅 hypertor
 
-**The Tor network library for Rust and Python** — consume AND host onion services with the simplicity of `reqwest` and `axum`.
+**Tor for Rust and Python.** Make HTTP requests over the Tor network, and host onion services.
 
 [![CI](https://github.com/hupe1980/hypertor/actions/workflows/ci.yml/badge.svg)](https://github.com/hupe1980/hypertor/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/hypertor.svg)](https://crates.io/crates/hypertor)
@@ -10,545 +10,371 @@
 
 ---
 
-## Why hypertor?
+hypertor is a thin layer over two mature pieces of software:
+[**arti**](https://gitlab.torproject.org/tpo/core/arti), the Tor Project's Rust implementation of
+Tor, and [**hyper**](https://hyper.rs), the HTTP stack `reqwest` is built on. It supplies the seam
+between them and the ergonomics on top.
 
-Most Tor libraries only do one thing: make requests. hypertor does both:
-
-| Component | Purpose | Similar To |
-|-----------|---------|------------|
-| **TorClient** | Make HTTP requests over Tor | `reqwest`, `httpx` |
-| **OnionService** | Host .onion services | `axum`, `FastAPI` |
-
-**Production-Ready Security** — All features wired to real arti APIs:
-
-| Feature | Purpose | arti API |
-|---------|---------|----------|
-| 🛡️ **Vanguards** | Guard discovery protection | `VanguardConfigBuilder::mode()` |
-| ⚡ **Proof-of-Work** | DoS protection (Equi-X) | `OnionServiceConfigBuilder::enable_pow()` |
-| 🚦 **Rate Limiting** | Intro point flooding protection | `rate_limit_at_intro()` |
-| 🔐 **Client Auth** | Restricted service discovery | `RestrictedDiscoveryConfigBuilder` |
-| 🌉 **Bridges** | Censorship circumvention | `TorClientConfigBuilder::bridges()` |
-| 🔌 **Pluggable Transports** | Traffic obfuscation | `TransportConfigBuilder` |
-
----
-
-## Quick Start
-
-### Rust — Client
+It implements no Tor protocol and no HTTP protocol of its own. That is the point: cryptography and
+protocol handling belong in the projects that specialise in them.
 
 ```rust
-use hypertor::{TorClient, Result};
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Create client (connects to Tor network)
-    let client = TorClient::new().await?;
-    
-    // Make requests just like reqwest
-    let resp = client
-        .get("http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion")?
-        .send()
-        .await?;
-    
-    println!("Tor Check: {}", resp.text()?);
-    Ok(())
-}
-```
-
-### Rust — Server
-
-```rust
-use hypertor::{OnionApp, ServeResponse};
+use hypertor::TorClient;
 
 #[tokio::main]
 async fn main() -> hypertor::Result<()> {
-    let app = OnionApp::new()
-        .get("/", || async { ServeResponse::text("Hello from .onion!") })
-        .get("/health", || async { 
-            ServeResponse::text(r#"{"status":"ok"}"#)
-                .with_header("Content-Type", "application/json")
-        });
-    
-    // Start the hidden service
-    let addr = app.run().await?;
-    println!("🧅 Live at: {}", addr);
+    let client = TorClient::new().await?;
+
+    let body = client
+        .get("https://check.torproject.org/api/ip")?
+        .send()
+        .await?
+        .error_for_status()?
+        .text()?;
+
+    println!("{body}");
     Ok(())
 }
 ```
 
-### Python — Client
-
 ```python
-import asyncio
-from hypertor import AsyncClient
+import hypertor
 
-async def main():
-    async with AsyncClient(timeout=60) as client:
-        # Check our Tor IP
-        resp = await client.get("https://check.torproject.org/api/ip")
-        print(f"Tor IP: {resp.json().get('IP')}")
-        
-        # Access an onion service
-        resp = await client.get(
-            "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion"
-        )
-        print(f"Status: {resp.status_code}")
-
-asyncio.run(main())
-```
-
-### Python — Server (FastAPI-style)
-
-```python
-from hypertor import OnionApp
-
-app = OnionApp()
-
-@app.get("/")
-async def home():
-    return "Welcome to my .onion service!"
-
-@app.post("/api/echo")
-async def echo(request):
-    data = await request.json()
-    return {"received": data}
-
-@app.get("/users/{user_id}")
-async def get_user(user_id: int):
-    return {"id": user_id, "name": "Alice"}
-
-if __name__ == "__main__":
-    app.run()  # 🧅 Service live at: xyz...xyz.onion
+with hypertor.Client() as client:
+    print(client.get("https://check.torproject.org/api/ip").json())
 ```
 
 ---
 
-## Installation
+## Install
 
-### Rust
+**Rust**
 
 ```toml
 [dependencies]
-hypertor = "0.4"
+hypertor = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
-### Python
+**Python**
 
 ```bash
 pip install hypertor
 ```
 
-### TLS Backends
-
-hypertor defaults to **rustls** for security reasons:
-
-| Backend | Default | Security | Notes |
-|---------|---------|----------|-------|
-| `rustls` | ✅ | **Best** | Consistent TLS fingerprint, pure Rust, memory-safe |
-| `native-tls` | | Good | Uses OS TLS stack, platform-specific fingerprints |
-
-#### Why rustls is the default
-
-For anonymity-focused applications, **TLS fingerprinting** is a real threat. Different TLS libraries produce different fingerprints based on cipher suite ordering, extensions, and timing. Using `native-tls` means:
-
-- **Linux**: OpenSSL fingerprint
-- **macOS**: SecureTransport fingerprint (also has Tor stream compatibility issues)
-- **Windows**: SChannel fingerprint
-
-This leaks your operating system to any observer. With `rustls`, you get the **same fingerprint on all platforms**, making it harder to distinguish users.
-
-Additionally, `rustls` is:
-- **Memory-safe**: Pure Rust, no C library vulnerabilities
-- **Auditable**: Easier to verify for security
-- **Isolated**: Not affected by compromised system CA stores
-
-If you need `native-tls` for specific compatibility:
-
-```toml
-[dependencies]
-hypertor = { version = "0.4", default-features = false, features = ["client", "native-tls"] }
-```
+No system Tor daemon is required. arti speaks the Tor protocol directly.
 
 ---
 
-## Features
+## What it does
 
-### 🔌 TorClient — HTTP Client
+| | |
+|---|---|
+| **`TorClient`** | HTTP/1.1 and HTTP/2 over Tor, with real connection pooling |
+| **`OnionService`** | Host a `.onion` service; hand you the raw inbound streams |
+| **`OnionApp`** | A small routed HTTP framework on top of `OnionService` |
+| **`SocksProxy`** | A local SOCKS5 front-end, so any program can use Tor |
+| **`TorWebSocket`** | WebSocket over Tor |
+
+---
+
+## Client
 
 ```rust
-use hypertor::{TorClient, IsolationLevel};
 use std::time::Duration;
+use hypertor::{IsolationLevel, TorClient};
 
-// Builder pattern for full control
 let client = TorClient::builder()
     .timeout(Duration::from_secs(60))
-    .max_connections(20)
-    .isolation(IsolationLevel::PerRequest)  // Fresh circuit per request
-    .follow_redirects(true)
+    .isolation(IsolationLevel::PerHost)
+    .max_retries(2)
     .build()
     .await?;
 
-// POST with typed JSON
-let resp = client.post("http://api.onion/users")?
-    .json(&User { name: "Alice".into() })
-    .send().await?;
+// JSON in, typed JSON out.
+let created: User = client
+    .post("http://api.onion/users")?
+    .json(&NewUser { name: "Alice".into() })
+    .send()
+    .await?
+    .error_for_status()?
+    .json()?;
 
-// Query parameters
-let resp = client.get("http://api.onion/search")?
-    .query(&[("q", "rust"), ("page", "1")])
-    .send().await?;
+// Query parameters, encoded for you.
+let results = client
+    .get("http://search.onion/")?
+    .query([("q", "rust & tor"), ("page", "1")])
+    .send()
+    .await?;
 ```
 
-### 🧅 OnionApp — Hidden Service Framework
+### Connection pooling is real
+
+The Tor connector plugs into hyper's pooling client, so a warm circuit is reused across requests.
+This matters more over Tor than anywhere else: building a circuit costs seconds, while a request on
+an established one costs a few hundred milliseconds.
 
 ```rust
-use hypertor::{OnionApp, OnionAppConfig, ServeRequest, ServeResponse, get};
-use std::time::Duration;
+client.get(url)?.send().await?;  // builds a circuit — slow
+client.get(url)?.send().await?;  // reuses it — fast
+```
 
-let config = OnionAppConfig::new()
-    .with_port(80)
-    .with_timeout(Duration::from_secs(30))
-    .with_key_path("/var/lib/myapp/keys");  // Persist .onion address
+---
 
-let app = OnionApp::with_config(config)
-    .get("/", || async { ServeResponse::text("Home") })
-    .post("/api/data", |req: ServeRequest| async move {
-        let body = req.text().unwrap_or_default();
-        ServeResponse::text(&format!(r#"{{"echo":{}}}"#, body))
+## Circuit isolation
+
+Two requests on the same circuit exit the Tor network from the same relay at the same time, and can
+be linked by anyone watching it. Isolation is how you decide which of your activities are allowed to
+be linked to each other.
+
+```rust
+use hypertor::IsolationToken;
+
+let alice = IsolationToken::new();
+let bob = IsolationToken::new();
+
+// Same token → same circuit. Different tokens → never the same circuit.
+client.get("http://forum.onion/inbox")?.isolation(alice).send().await?;
+client.get("http://forum.onion/profile")?.isolation(alice).send().await?;
+client.get("http://shop.onion/cart")?.isolation(bob).send().await?;
+```
+
+| `IsolationLevel` | Behaviour | Cost |
+|---|---|---|
+| `None` | hypertor adds no isolation | Cheapest |
+| `PerHost` *(default)* | One circuit family per destination host | Reuses warm circuits |
+| `PerRequest` | A fresh circuit for every request | Seconds per request |
+| `Fixed(token)` | One explicit token for everything | — |
+
+---
+
+## Hosting an onion service
+
+```rust
+use hypertor::{OnionApp, OnionService, ServeResponse};
+
+let app = OnionApp::new()
+    .get("/", |_req| async { ServeResponse::html("<h1>hello</h1>") })
+    .get("/health", |_req| async {
+        ServeResponse::json(&serde_json::json!({"status": "ok"}))
     })
-    .route("/health", get(|| async {
-        ServeResponse::text(r#"{"status":"healthy"}"#)
-            .with_header("Content-Type", "application/json")
-    }));
+    .get("/users/{id}", |req| async move {
+        let id = req.param("id").unwrap_or_default().to_string();
+        ServeResponse::json(&serde_json::json!({ "id": id }))
+    });
 
-let addr = app.run().await?;  // Returns "abc...xyz.onion"
+let service = OnionService::builder()
+    .nickname("my-service")?
+    .state_dir("/var/lib/my-service")   // keeps the .onion address stable
+    .launch()
+    .await?;
+
+let serving = app.serve_on(service).await?;
+println!("live at {}", serving.onion_address());
+serving.wait().await
 ```
 
-### 🔐 Security Configuration
+> **`state_dir` is what makes your address permanent.** A `.onion` address is derived from a keypair
+> arti stores there. A service launched without one gets a brand-new address on every restart. Treat
+> the directory as secret: anyone who copies it can impersonate your service.
 
-hypertor provides security presets that configure real arti hardening features:
+The HTTP is hyper's, so chunked bodies, keep-alive, pipelining and HTTP/2 all behave exactly as they
+do in any other hyper server.
 
-```rust
-use hypertor::security::{SecurityLevel, ServiceSecurityConfig};
-use hypertor::onion_service::OnionServiceConfig;
+### Hardening
 
-// Security presets for onion services
-let standard = ServiceSecurityConfig::standard();   // Basic protection
-let enhanced = ServiceSecurityConfig::enhanced();   // PoW + rate limiting
-let maximum = ServiceSecurityConfig::maximum();     // Full hardening
-
-// Or configure manually with fluent API
-let config = OnionServiceConfig::new("my-service")
-    .with_pow()                        // Proof-of-Work (Equi-X)
-    .pow_queue_depth(16000)            // Queue depth
-    .rate_limit_at_intro(10.0, 20)     // Rate: 10/s, burst: 20
-    .max_streams_per_circuit(100)      // Stream limit
-    .vanguards_full()                  // Full vanguards
-    .num_intro_points(5);              // High availability
-```
-
-### 🌉 Censorship Circumvention (China, Iran, Russia)
+Every option maps to an arti feature; hypertor implements none of this itself.
 
 ```rust
-use hypertor::{TorClientBuilder, VanguardMode};
-
-let client = TorClientBuilder::new()
-    // Multiple bridges for redundancy
-    .bridge("obfs4 192.0.2.1:443 FINGERPRINT cert=... iat-mode=0")
-    .bridge("obfs4 192.0.2.2:443 FINGERPRINT cert=... iat-mode=0")
-    // Pluggable transport binary
-    .transport("obfs4", "/usr/bin/obfs4proxy")
-    // Full vanguards for hostile networks
-    .vanguards(VanguardMode::Full)
-    .build()
+OnionService::builder()
+    .nickname("high-value")?
+    .state_dir("/var/lib/svc")
+    .vanguards(hypertor::VanguardMode::Full)   // guard-discovery defence
+    .proof_of_work(true)                        // Equi-X PoW — needs the `pow` feature
+    .rate_limit_at_intro(10, 20)                // token bucket at intro points
+    .num_intro_points(5)                        // availability
+    .authorize_client("alice", alice_key)       // restricted discovery
+    .launch()
     .await?;
 ```
 
-### 🔄 Stream Isolation
+Proof of work needs the `pow` feature. It is not part of `full` because the Equi-X implementation
+(`equix`, `hashx`) is LGPL-3.0-only while hypertor is MIT — a default build stays entirely
+permissively licensed, and enabling PoW without the feature is an error at launch rather than a
+silently unprotected service.
 
-Keep different activities on separate Tor circuits:
+**Restricted discovery** is the strongest defence available: with any client authorised, the service
+descriptor is encrypted so only holders of the listed keys can even find the introduction points.
+Clients generate their own keys (`arti hsc get-key`) — hypertor will not generate them for you,
+because the secret half must never exist on the server.
+
+---
+
+## SOCKS5 proxy
+
+Route any SOCKS5-capable program through Tor.
 
 ```rust
-use hypertor::{TorClient, IsolationToken};
+use hypertor::{SocksConfig, SocksProxy, TorClient};
 
 let client = TorClient::new().await?;
-
-// Create isolated sessions
-let banking = IsolationToken::new();
-let browsing = IsolationToken::new();
-
-// These use the same circuit (banking identity)
-client.get("http://bank.onion")?.isolation(banking.clone()).send().await?;
-client.get("http://bank.onion/transfer")?.isolation(banking.clone()).send().await?;
-
-// This uses a different circuit (browsing identity)
-client.get("http://news.onion")?.isolation(browsing.clone()).send().await?;
+SocksProxy::from_client(&client, SocksConfig::default()).run().await
 ```
-
-### ⚡ Resilience Features
-
-```rust
-use hypertor::{
-    CircuitBreaker, BreakerConfig,
-    AdaptiveRetry, AdaptiveRetryConfig,
-    TokenBucket,
-};
-
-// Circuit breaker - fail fast when service is down
-let breaker = CircuitBreaker::new(BreakerConfig {
-    failure_threshold: 5,
-    reset_timeout: Duration::from_secs(30),
-    ..Default::default()
-});
-
-// Adaptive retry - learns optimal behavior
-let retry = AdaptiveRetry::new(AdaptiveRetryConfig {
-    max_attempts: 3,
-    min_delay: Duration::from_millis(100),
-    max_delay: Duration::from_secs(10),
-    ..Default::default()
-});
-
-// Rate limiting
-let limiter = TokenBucket::new(100, 100.0);  // 100 req/sec
-```
-
-### 📊 Observability
-
-```rust
-use hypertor::{TorMetrics, export_metrics};
-
-let metrics = TorMetrics::new();
-
-// Record operations
-metrics.record_request("GET", 200, 1.5, 100, 5000);
-metrics.record_circuit_build(true, 2.0);
-
-// Export Prometheus format
-let prometheus_text = metrics.export();
-// # HELP hypertor_http_requests_total Total HTTP requests
-// # TYPE hypertor_http_requests_total counter
-// hypertor_http_requests_total{method="GET",status="200"} 1
-```
-
-### 🌉 Bridge Support (Censorship Circumvention)
-
-```rust
-use hypertor::{TorClientBuilder, VanguardMode};
-
-// Configure bridges and transports via builder
-let client = TorClientBuilder::new()
-    .bridge("obfs4 192.0.2.1:443 FINGERPRINT cert=CERT iat-mode=0")
-    .transport("obfs4", "/usr/bin/obfs4proxy")
-    .vanguards(VanguardMode::Full)
-    .build()
-    .await?;
-```
-
-### � SOCKS5 Proxy
-
-Run a local SOCKS5 proxy to route ANY application through Tor:
-
-```rust
-use hypertor::{Socks5Proxy, ProxyConfig};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-// Start SOCKS5 proxy on localhost:9050
-let proxy = Socks5Proxy::with_defaults();
-proxy.run().await?;  // Runs on 127.0.0.1:9050
-```
-
-Then use with any SOCKS5-compatible tool:
 
 ```bash
-# curl
 curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
-
-# Python requests
-proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
-requests.get('https://example.com', proxies=proxies)
-
-# wget, git, ssh, browsers...
 ```
 
-### �🔌 WebSocket over Tor
+**Use `socks5h`, never `socks5`.** `socks5://` makes the client resolve DNS locally first, leaking a
+plaintext query from your real IP for every host you visit. hypertor's proxy rejects requests
+carrying a locally-resolved IP literal by default, so a misconfigured client fails loudly rather
+than leaking quietly.
 
-```rust
-use hypertor::websocket::TorWebSocket;
+Different SOCKS credentials get different circuits, following Tor's `IsolateSOCKSAuth` convention:
 
-// Connect to WebSocket over Tor
-let mut ws = TorWebSocket::connect("ws://chat.onion/ws").await?;
-
-// Send and receive messages
-ws.send_text("Hello, Tor!").await?;
-let msg = ws.recv().await?;
-```
-
-### 📡 HTTP/2 Support
-
-```rust
-use hypertor::http2::{Http2Connection, Http2Config};
-
-// HTTP/2 multiplexing over Tor
-let mut conn = Http2Connection::client(Http2Config::default());
-let stream_id = conn.create_stream()?;
-conn.send_headers(stream_id, headers, false)?;
-conn.send_data(stream_id, body, true)?;
+```bash
+curl -x socks5h://alice:x@127.0.0.1:9050 https://example.com   # circuit A
+curl -x socks5h://bob:x@127.0.0.1:9050   https://example.com   # circuit B
 ```
 
 ---
 
-## Architecture
+## Python
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        YOUR APPLICATION                          │
-├─────────────────────────────────────────────────────────────────┤
-│  TorClient          │  OnionService       │  OnionApp (serve)   │
-│  (HTTP over Tor)    │  (host .onion)      │  (axum-like API)    │
-├─────────────────────────────────────────────────────────────────┤
-│                         hypertor core                            │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────────┐   │
-│  │ Circuits │ │ Security │ │Resilience│ │ Observability    │   │
-│  │ Pooling  │ │ Vanguards│ │ Retry    │ │ Metrics/Tracing  │   │
-│  │ Isolation│ │ PoW/Auth │ │ Breaker  │ │ Health Checks    │   │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────────────┘   │
-├─────────────────────────────────────────────────────────────────┤
-│                     arti-client 0.38 (Tor)                       │
-└─────────────────────────────────────────────────────────────────┘
+```python
+import hypertor
+
+# Sync
+with hypertor.Client(timeout=60, isolation="per_host") as client:
+    response = client.get("http://api.onion/data")
+    response.raise_for_status()
+    print(response.json())
+
+    client.post("http://api.onion/users", json={"name": "Alice"})
 ```
 
-### Module Overview
+```python
+import asyncio
 
-| Category | Modules |
-|----------|---------|
-| **Core** | `client`, `serve`, `onion_service`, `config`, `error`, `body` |
-| **Security** | `security` (presets, vanguards, PoW, rate limiting) |
-| **Networking** | `pool`, `isolation`, `circuit`, `proxy` (SOCKS5), `dns`, `doh`, `tls` |
-| **Resilience** | `retry`, `breaker`, `rotation`, `adaptive`, `backpressure` |
-| **Performance** | `cache`, `dedup`, `ratelimit`, `queue`, `prewarm`, `batch` |
-| **Protocols** | `http2`, `websocket` |
-| **Observability** | `observability`, `prometheus`, `tracing`, `health`, `metrics` |
+async def main():
+    async with hypertor.AsyncClient() as client:
+        # Concurrent, over separate circuits.
+        responses = await asyncio.gather(
+            client.get("http://a.onion/"),
+            client.get("http://b.onion/"),
+        )
+
+asyncio.run(main())
+```
+
+```python
+# Hosting a service
+app = hypertor.OnionApp("my-service", state_dir="./onion-state")
+
+@app.get("/")
+def home(request):
+    return "hello from .onion"
+
+@app.get("/users/{user_id}")
+def get_user(request):
+    return {"id": request.params["user_id"]}
+
+app.run()   # prints the .onion address, then serves
+```
+
+The bindings release the GIL for the duration of every network call, so a Tor request does not
+freeze the rest of your program.
 
 ---
 
-## Examples
+## Feature flags
 
-### Basic Client Usage
+| Feature | Default | Adds |
+|---|---|---|
+| `client` | ✅ | `TorClient` and the HTTP client stack |
+| `rustls` | ✅ | TLS via rustls — identical fingerprint on every platform |
+| `native-tls` | | TLS via the OS stack (see below) |
+| `server` | | `OnionService`, `OnionApp` |
+| `pow` | | Equi-X proof of work — **pulls in LGPL-3.0 crates** |
+| `socks` | | `SocksProxy` |
+| `ws` | | `TorWebSocket` |
+| `python` | | the PyO3 bindings |
 
-```bash
-cargo run --example basic_usage
+```toml
+hypertor = { version = "0.3", features = ["server", "socks"] }
 ```
 
-### Security Features Demo
+### Why rustls is the default
 
-```bash
-cargo run --example security_features
-```
+TLS handshakes are fingerprintable: the set and ordering of cipher suites, extensions and supported
+groups differ per implementation. `native-tls` binds to whatever the host provides — OpenSSL on
+Linux, SecureTransport on macOS, SChannel on Windows — so your handshake announces your operating
+system to the exit relay. With `rustls`, every hypertor user emits the same ClientHello.
 
-### SOCKS5 Proxy
-
-```bash
-cargo run --example socks_proxy
-# Then: curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
-```
+`native-tls` also cannot enforce a TLS 1.3 floor or negotiate ALPN, so `min_tls_version(Tls13)` is
+an error there rather than a silent downgrade, and HTTP/2 over TLS is unavailable.
 
 ---
 
-## Metrics
+## Security notes
 
-| Metric | Value |
-|--------|-------|
-| Source Files | 51 |
-| Lines of Code | ~26,900 |
-| Unit Tests | 207 |
-| Integration Tests | 26 |
-| Security Tests | 58 |
-| Doc Tests | 1 |
-| **Total Tests** | **292** |
-| arti Version | 0.38 |
-| Rust Edition | 2024 |
-| MSRV | 1.85 |
+**What the design protects against**
 
-Run all tests:
-```bash
-cargo test                     # All 292 tests
-cargo test --test security     # Security tests (58)
-```
+| | |
+|---|---|
+| DNS leaking your destinations | Hostnames are always resolved by the exit relay, never locally |
+| Credentials replayed to another host | Stripped on any cross-origin redirect |
+| A `.onion` redirecting you to clearnet | Refused unless explicitly allowed |
+| Hostnames leaking into your logs | Scrubbed in `Error` output by default (via `safelog`) |
+| Decompression bombs | The size limit applies to the *decompressed* body |
+| Path traversal in static files | Paths are canonicalised and confined to the root |
+| Response splitting | Header values containing CR/LF are refused |
+| Guard discovery | `VanguardMode`, wired to arti |
+| Introduction floods | Proof-of-work and intro rate limiting, wired to arti |
 
----
+**What no library can protect against**
 
-## Security Considerations
-
-### What hypertor Protects Against
-
-| Threat | Protection | Implementation |
-|--------|------------|----------------|
-| Guard discovery | Vanguards (Lite/Full) | `VanguardConfigBuilder::mode()` |
-| DoS attacks | Proof-of-Work (Equi-X) | `OnionServiceConfigBuilder::enable_pow()` |
-| Intro flooding | Rate limiting | `rate_limit_at_intro()` |
-| Stream flooding | Stream limits | `max_concurrent_streams_per_circuit()` |
-| IP exposure | Bridges + transports | `TorClientConfigBuilder::bridges()` |
-| Unauthorized access | Client authorization | `RestrictedDiscoveryConfigBuilder` |
-| Secret leaks | Zeroize on drop | `SecretKey` with `ZeroizeOnDrop` |
-
-### What hypertor Does NOT Protect Against
-
-- ❌ Application-level data leaks (your code)
-- ❌ Timing attacks from your application logic
-- ❌ Malware on your system
-- ❌ Compromised exit nodes (for clearnet access)
+hypertor is not an anonymity system in its own right. Tor protects the network path. It cannot
+protect you from an application that logs in with your real identity, from timing patterns in your
+own traffic, from a browser fingerprint, or from a compromised machine. Read the
+[Tor Project's guidance](https://support.torproject.org/) before relying on this for anything that
+matters.
 
 ---
 
 ## Development
 
 ```bash
-# Run tests
-cargo test --lib
+cargo test --all-features          # unit and integration tests
+cargo test -- --ignored            # tests that need a live Tor connection
+cargo clippy --all-targets --all-features -- -D warnings
+cargo bench
 
-# Run clippy
-cargo clippy --lib -- -D warnings
-
-# Build Python wheel
-maturin develop --features python
-
-# Run example
-cargo run --example basic_usage
-
-# Serve docs locally
-just docs
+maturin develop --features python  # build the Python extension
+pytest                             # offline Python tests
+pytest -m network                  # includes live tests
 ```
 
 ---
 
 ## Documentation
 
-- [Quick Start Guide](https://hupe1980.github.io/hypertor/docs/quickstart/)
-- [TorClient API](https://hupe1980.github.io/hypertor/docs/client/)
-- [OnionApp API](https://hupe1980.github.io/hypertor/docs/server/)
-- [Security Features](https://hupe1980.github.io/hypertor/docs/security/)
-- [Python Bindings](https://hupe1980.github.io/hypertor/docs/python/)
+- [Quick start](https://hupe1980.github.io/hypertor/docs/quickstart/)
+- [Client](https://hupe1980.github.io/hypertor/docs/client/)
+- [Onion services](https://hupe1980.github.io/hypertor/docs/server/)
+- [SOCKS5 proxy](https://hupe1980.github.io/hypertor/docs/proxy/)
+- [Security](https://hupe1980.github.io/hypertor/docs/security/)
+- [Python](https://hupe1980.github.io/hypertor/docs/python/)
+- [API reference on docs.rs](https://docs.rs/hypertor)
 
 ---
 
-## ⚠️ Disclaimer
+## Disclaimer
 
-**This software is provided for educational and research purposes only.**
-
-- **No Anonymity Guarantee**: While hypertor leverages the Tor network via arti, no software can guarantee complete anonymity. Your operational security practices, threat model, and usage patterns significantly impact your privacy.
-- **No Warranty**: This software is provided "as is" without warranty of any kind. The authors are not responsible for any damages or legal consequences arising from its use.
-- **Legal Compliance**: Users are solely responsible for ensuring their use of this software complies with all applicable laws and regulations in their jurisdiction.
-- **Not Endorsed by Tor Project**: This is an independent project and is not affiliated with, endorsed by, or sponsored by The Tor Project.
-- **Security Considerations**: Always review the [Security Guide](https://hupe1980.github.io/hypertor/docs/security/) before deploying in production.
-
----
+Provided for research and educational use. No anonymity guarantee: your operational security,
+threat model and usage patterns matter more than any library. Not affiliated with, endorsed by, or
+sponsored by the Tor Project. You are responsible for complying with the law where you are.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions welcome! Please open issues and pull requests on GitHub.
+MIT. See [LICENSE](LICENSE).

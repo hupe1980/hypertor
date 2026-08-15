@@ -1,86 +1,89 @@
-# hypertor justfile - common development tasks
+# hypertor — common development tasks
 
-# Default recipe
 default:
     @just --list
 
-# Run all checks (quick)
+# Fast pre-commit checks
 check: fmt-check lint test
 
-# Run full pre-release checks
-check-full:
-    ./scripts/check.sh --full
+# Everything CI runs
+check-all: fmt-check lint test test-py docs audit
 
-# Run quick pre-release checks
-check-quick:
-    ./scripts/check.sh --quick
-
-# Run release-ready checks
-check-release:
-    ./scripts/check.sh --release
-
-# Format code
+# Format
 fmt:
-    cargo fmt
-    uvx ruff format python/
+    cargo fmt --all
+    uvx ruff format python/ python_examples/
 
-# Check formatting
 fmt-check:
-    cargo fmt --check
-    uvx ruff format --check python/
+    cargo fmt --all -- --check
+    uvx ruff format --check python/ python_examples/
 
 # Lint
 lint:
-    cargo clippy --lib --all-features -- -D warnings
-    uvx ruff check python/
+    cargo clippy --all-targets --features full -- -D warnings
+    uvx ruff check python/ python_examples/
 
-# Run tests
+# Rust tests (offline)
 test:
-    cargo test --lib --features="client,server,http2,padding,native-tls"
+    cargo test --features full
 
-# Run all tests including security and integration
-test-all:
-    cargo test --features="client,server,http2,padding,native-tls"
-    cargo test --test security --features="client,server,http2,padding,native-tls"
-    cargo test --test integration --features="client,server,http2,padding,native-tls"
+# Tests that need a live Tor connection
+test-live:
+    cargo test --features full -- --ignored --nocapture
 
-# Run security tests only
-test-security:
-    cargo test --test security --features="client,server,http2,padding,native-tls"
+# Python tests (offline)
+test-py: build-py
+    uv run pytest python/tests -v
 
-# Run cargo deny checks
-deny:
-    cargo deny check
+# Python tests including live network
+test-py-live: build-py
+    uv run pytest python/tests -v -m network
 
-# Build Python wheel (development)
+# Feature-combination checks
+test-features:
+    cargo check --no-default-features --features "client,rustls"
+    cargo check --no-default-features --features "client,native-tls"
+    cargo check --no-default-features --features "server,rustls"
+    cargo check --features full
+
+# Docs
+docs:
+    cargo doc --features full --no-deps
+
+docs-open:
+    cargo doc --features full --no-deps --open
+
+# Supply chain
+audit:
+    cargo audit
+    cargo deny check bans advisories sources
+
+# Benchmarks
+bench:
+    cargo bench --features full
+
+# Python extension
 build-py:
     maturin develop --features python
 
-# Build Python wheel (release)
 build-py-release:
     maturin build --release --features python
 
-# Install dev dependencies
+# Examples
+example name="client":
+    cargo run --example {{name}} --features full
+
+# Documentation site
+site:
+    cd docs && bundle exec jekyll serve --livereload --config _config.yml,_config_dev.yml
+
+site-setup:
+    cd docs && bundle install
+
+# Dev environment
 setup:
     uv sync --all-extras
 
-# Clean build artifacts
 clean:
     cargo clean
-    rm -rf target/ dist/ *.egg-info/
-
-# Run example
-example name="basic_usage":
-    cargo run --example {{name}}
-
-# Start SOCKS5 proxy (requires Tor bootstrap)
-proxy port="9050":
-    cargo run --example proxy -- --port {{port}}
-
-# Serve documentation locally with GitHub Pages
-docs:
-    cd docs && bundle exec jekyll serve --livereload --config _config.yml,_config_dev.yml
-
-# Install documentation dependencies
-docs-setup:
-    cd docs && bundle install
+    rm -rf target/ dist/ *.egg-info/ docs/_site/

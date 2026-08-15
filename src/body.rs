@@ -1,225 +1,268 @@
-//! HTTP Body encoding utilities
-//!
-//! Provides form encoding, JSON encoding, and multipart support.
+//! Request body encoding and response body decoding.
 
 use bytes::Bytes;
-use http::header::HeaderValue;
+use http::HeaderValue;
+use http::header::CONTENT_ENCODING;
 
 use crate::error::{Error, Result};
 
-/// A request body with its content-type
-#[derive(Debug, Clone)]
-pub struct Body {
-    /// The encoded body data
-    pub data: Bytes,
-    /// The content-type header value
-    pub content_type: HeaderValue,
+/// Content encodings hypertor can decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Encoding {
+    /// No encoding.
+    #[default]
+    Identity,
+    /// RFC 1952 gzip.
+    Gzip,
+    /// RFC 1950 zlib / deflate.
+    Deflate,
+    /// RFC 7932 Brotli.
+    Brotli,
+    /// RFC 8878 Zstandard.
+    Zstd,
 }
 
-impl Body {
-    /// Create a body from raw bytes with a content-type
-    #[must_use]
-    pub fn raw(data: impl Into<Bytes>, content_type: &str) -> Self {
-        Self {
-            data: data.into(),
-            // Safety: content_type should be a valid header value
-            content_type: HeaderValue::from_str(content_type)
-                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+impl Encoding {
+    /// The value hypertor sends in `Accept-Encoding`.
+    pub fn accept_encoding() -> HeaderValue {
+        HeaderValue::from_static("gzip, br, zstd, deflate")
+    }
+
+    /// Parse a single `Content-Encoding` token.
+    pub fn parse(token: &str) -> Self {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "gzip" | "x-gzip" => Self::Gzip,
+            "deflate" => Self::Deflate,
+            "br" => Self::Brotli,
+            "zstd" => Self::Zstd,
+            _ => Self::Identity,
         }
     }
 
-    /// Create a JSON body
+    /// The encoding named by a response's `Content-Encoding` header.
     ///
-    /// Note: This does not serialize - it expects pre-serialized JSON
-    #[must_use]
-    pub fn json(json_str: impl Into<Bytes>) -> Self {
-        Self {
-            data: json_str.into(),
-            content_type: HeaderValue::from_static("application/json; charset=utf-8"),
+    /// Only single-encoding responses are supported. A stacked encoding such as
+    /// `gzip, br` is rejected rather than silently half-decoded.
+    pub fn from_headers(headers: &http::HeaderMap) -> Result<Self> {
+        let Some(value) = headers.get(CONTENT_ENCODING) else {
+            return Ok(Self::Identity);
+        };
+
+        let value = value
+            .to_str()
+            .map_err(|_| Error::decode("Content-Encoding is not valid ASCII"))?;
+
+        let mut encodings = value
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("identity"));
+
+        let Some(first) = encodings.next() else {
+            return Ok(Self::Identity);
+        };
+
+        if encodings.next().is_some() {
+            return Err(Error::decode(format!(
+                "stacked Content-Encoding `{value}` is not supported"
+            )));
         }
-    }
 
-    /// Create a form-urlencoded body from key-value pairs
-    pub fn form<I, K, V>(params: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        let encoded: String = params
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", url_encode(k.as_ref()), url_encode(v.as_ref())))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        Ok(Self {
-            data: Bytes::from(encoded),
-            content_type: HeaderValue::from_static("application/x-www-form-urlencoded"),
-        })
-    }
-
-    /// Create a plain text body
-    #[must_use]
-    pub fn text(text: impl Into<Bytes>) -> Self {
-        Self {
-            data: text.into(),
-            content_type: HeaderValue::from_static("text/plain; charset=utf-8"),
+        match Self::parse(first) {
+            Self::Identity => Err(Error::decode(format!(
+                "unsupported Content-Encoding `{first}`"
+            ))),
+            known => Ok(known),
         }
-    }
-
-    /// Create an empty body
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            data: Bytes::new(),
-            content_type: HeaderValue::from_static(""),
-        }
-    }
-
-    /// Get the body length
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if the body is empty
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
     }
 }
 
-/// URL-encode a string (percent encoding)
-fn url_encode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() * 3);
-    for c in s.bytes() {
-        match c {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(c as char);
-            }
-            b' ' => result.push('+'),
-            _ => {
-                result.push('%');
-                result.push(HEX_CHARS[(c >> 4) as usize] as char);
-                result.push(HEX_CHARS[(c & 0x0F) as usize] as char);
-            }
-        }
-    }
-    result
-}
+/// Decode a response body.
+///
+/// `limit` bounds the *decompressed* size. Enforcing it here is what stops a
+/// decompression bomb: a few kilobytes of gzip can expand to gigabytes, so the
+/// limit has to apply to the output, not just the transferred bytes.
+pub fn decode(data: &[u8], encoding: Encoding, limit: usize) -> Result<Bytes> {
+    use std::io::Read;
 
-const HEX_CHARS: &[u8; 16] = b"0123456789ABCDEF";
-
-/// URL-decode a string
-pub fn url_decode(s: &str) -> Result<String> {
-    let mut result = Vec::with_capacity(s.len());
-    let mut bytes = s.bytes();
-
-    while let Some(c) = bytes.next() {
-        match c {
-            b'+' => result.push(b' '),
-            b'%' => {
-                let high = bytes
-                    .next()
-                    .ok_or_else(|| Error::http("incomplete percent encoding"))?;
-                let low = bytes
-                    .next()
-                    .ok_or_else(|| Error::http("incomplete percent encoding"))?;
-                let byte = hex_to_byte(high, low)
-                    .ok_or_else(|| Error::http("invalid percent encoding"))?;
-                result.push(byte);
-            }
-            _ => result.push(c),
-        }
+    if encoding == Encoding::Identity {
+        return Ok(Bytes::copy_from_slice(data));
     }
 
-    String::from_utf8(result).map_err(|_| Error::http("URL-decoded string is not valid UTF-8"))
-}
+    // Read one byte past the limit so an exactly-at-limit body still succeeds
+    // while an oversized one is detected without decoding all of it.
+    let mut out = Vec::new();
+    let budget = (limit as u64).saturating_add(1);
 
-/// Convert two hex characters to a byte
-fn hex_to_byte(high: u8, low: u8) -> Option<u8> {
-    let high = match high {
-        b'0'..=b'9' => high - b'0',
-        b'A'..=b'F' => high - b'A' + 10,
-        b'a'..=b'f' => high - b'a' + 10,
-        _ => return None,
+    let result = match encoding {
+        Encoding::Gzip => flate2::read::GzDecoder::new(data)
+            .take(budget)
+            .read_to_end(&mut out),
+        Encoding::Deflate => flate2::read::ZlibDecoder::new(data)
+            .take(budget)
+            .read_to_end(&mut out),
+        Encoding::Brotli => brotli::Decompressor::new(data, 8192)
+            .take(budget)
+            .read_to_end(&mut out),
+        Encoding::Zstd => zstd::stream::read::Decoder::new(data)
+            .map_err(|e| Error::decode(format!("zstd: {e}")))?
+            .take(budget)
+            .read_to_end(&mut out),
+        Encoding::Identity => unreachable!("handled above"),
     };
-    let low = match low {
-        b'0'..=b'9' => low - b'0',
-        b'A'..=b'F' => low - b'A' + 10,
-        b'a'..=b'f' => low - b'a' + 10,
-        _ => return None,
-    };
-    Some((high << 4) | low)
+
+    result.map_err(|e| Error::decode(format!("{encoding:?} body is malformed: {e}")))?;
+
+    if out.len() > limit {
+        return Err(Error::BodyTooLarge {
+            size: out.len(),
+            limit,
+        });
+    }
+
+    Ok(Bytes::from(out))
 }
 
-/// Basic authentication header
-pub fn basic_auth(username: &str, password: &str) -> HeaderValue {
+/// Percent-encode a string for use in a query or form value.
+///
+/// Uses the `application/x-www-form-urlencoded` rules: unreserved characters
+/// pass through, spaces become `+`, everything else is percent-encoded.
+pub fn form_encode(pairs: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (k, v) in pairs {
+        serializer.append_pair(k.as_ref(), v.as_ref());
+    }
+    serializer.finish()
+}
+
+/// Build an HTTP Basic `Authorization` header value.
+pub fn basic_auth(username: &str, password: &str) -> Result<HeaderValue> {
     use base64::Engine;
-    let credentials = format!("{}:{}", username, password);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
-    let header_value = format!("Basic {}", encoded);
-    // Safety: base64 output is always valid header value
-    HeaderValue::from_str(&header_value)
-        .unwrap_or_else(|_| HeaderValue::from_static("Basic invalid"))
+
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+
+    let mut value = HeaderValue::from_str(&format!("Basic {encoded}"))
+        .map_err(|_| Error::invalid_request("credentials are not valid in an HTTP header"))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
-/// Bearer authentication header
+/// Build a Bearer `Authorization` header value.
 pub fn bearer_auth(token: &str) -> Result<HeaderValue> {
-    let header_value = format!("Bearer {}", token);
-    HeaderValue::from_str(&header_value).map_err(|_| Error::http("invalid bearer token"))
-}
-
-/// Content-Length header
-#[must_use]
-pub fn content_length(len: usize) -> HeaderValue {
-    // Safety: numbers are always valid header values
-    HeaderValue::from_str(&len.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0"))
+    let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| Error::invalid_request("token is not valid in an HTTP header"))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use http::HeaderMap;
 
-    #[test]
-    fn test_url_encode() {
-        assert_eq!(url_encode("hello world"), "hello+world");
-        assert_eq!(url_encode("foo=bar&baz"), "foo%3Dbar%26baz");
-        assert_eq!(url_encode("日本語"), "%E6%97%A5%E6%9C%AC%E8%AA%9E");
+    fn headers_with(encoding: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_ENCODING, HeaderValue::from_str(encoding).unwrap());
+        h
     }
 
     #[test]
-    fn test_url_decode() {
-        assert_eq!(url_decode("hello+world").unwrap(), "hello world");
-        assert_eq!(url_decode("foo%3Dbar%26baz").unwrap(), "foo=bar&baz");
-    }
-
-    #[test]
-    fn test_form_body() {
-        let body = Body::form([("name", "John Doe"), ("age", "30")]).unwrap();
-        assert_eq!(body.data.as_ref(), b"name=John+Doe&age=30");
+    fn identity_when_no_header() {
         assert_eq!(
-            body.content_type.to_str().unwrap(),
-            "application/x-www-form-urlencoded"
+            Encoding::from_headers(&HeaderMap::new()).unwrap(),
+            Encoding::Identity
         );
     }
 
     #[test]
-    fn test_json_body() {
-        let body = Body::json(r#"{"key": "value"}"#);
-        assert_eq!(body.data.as_ref(), br#"{"key": "value"}"#);
-        assert!(
-            body.content_type
-                .to_str()
-                .unwrap()
-                .contains("application/json")
-        );
+    fn recognises_supported_encodings() {
+        for (header, expected) in [
+            ("gzip", Encoding::Gzip),
+            ("GZIP", Encoding::Gzip),
+            ("br", Encoding::Brotli),
+            ("zstd", Encoding::Zstd),
+            ("deflate", Encoding::Deflate),
+            ("identity", Encoding::Identity),
+        ] {
+            assert_eq!(
+                Encoding::from_headers(&headers_with(header)).unwrap(),
+                expected,
+                "header: {header}"
+            );
+        }
     }
 
     #[test]
-    fn test_basic_auth() {
-        let header = basic_auth("user", "pass");
-        assert_eq!(header.to_str().unwrap(), "Basic dXNlcjpwYXNz");
+    fn rejects_stacked_and_unknown_encodings() {
+        // Half-decoding is worse than refusing: the caller would get bytes that
+        // look like a body but are still compressed.
+        assert!(Encoding::from_headers(&headers_with("gzip, br")).is_err());
+        assert!(Encoding::from_headers(&headers_with("exotic")).is_err());
+    }
+
+    #[test]
+    fn round_trips_gzip() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"hello over tor").unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let out = decode(&compressed, Encoding::Gzip, 1024).unwrap();
+        assert_eq!(&out[..], b"hello over tor");
+    }
+
+    #[test]
+    fn decompression_bomb_is_stopped_at_the_limit() {
+        use std::io::Write;
+        // 4 MiB of zeroes compresses to a few KiB.
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(bomb.len() < 64 * 1024, "test fixture should be small");
+
+        let err = decode(&bomb, Encoding::Gzip, 1024).unwrap_err();
+        assert!(matches!(err, Error::BodyTooLarge { limit: 1024, .. }));
+    }
+
+    #[test]
+    fn body_exactly_at_the_limit_is_accepted() {
+        use std::io::Write;
+        let payload = vec![b'x'; 1024];
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&payload).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let out = decode(&compressed, Encoding::Gzip, 1024).unwrap();
+        assert_eq!(out.len(), 1024);
+    }
+
+    #[test]
+    fn malformed_bodies_error_rather_than_returning_garbage() {
+        assert!(decode(b"not gzip at all", Encoding::Gzip, 1024).is_err());
+    }
+
+    #[test]
+    fn form_encoding_escapes_separators() {
+        let encoded = form_encode([("q", "rust & tor"), ("page", "1")]);
+        assert_eq!(encoded, "q=rust+%26+tor&page=1");
+    }
+
+    #[test]
+    fn auth_headers_are_marked_sensitive() {
+        // Marking these sensitive keeps them out of HPACK's shared compression
+        // table, where they would otherwise be a cross-request oracle.
+        assert!(basic_auth("user", "pass").unwrap().is_sensitive());
+        assert!(bearer_auth("tok").unwrap().is_sensitive());
+    }
+
+    #[test]
+    fn basic_auth_matches_rfc7617() {
+        let value = basic_auth("user", "pass").unwrap();
+        assert_eq!(value.to_str().unwrap(), "Basic dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn header_injection_via_credentials_is_rejected() {
+        assert!(bearer_auth("tok\r\nX-Admin: 1").is_err());
     }
 }

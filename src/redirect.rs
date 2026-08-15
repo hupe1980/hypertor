@@ -1,310 +1,317 @@
-//! Redirect handling
+//! Redirect handling.
 //!
-//! Safe redirect following with security checks.
+//! # Why redirects need care over Tor
+//!
+//! A redirect is the server choosing your next request. Followed naively it can
+//! move you from an onion service to a clearnet host — taking your traffic out
+//! through an exit relay that can read and modify it — or replay your
+//! `Authorization` header to a host you never chose to trust.
+//!
+//! hypertor therefore defaults to [`RedirectPolicy::limited`], which follows
+//! redirects but strips credentials whenever the origin changes, and refuses to
+//! downgrade from an onion service to clearnet.
 
-use std::collections::HashSet;
+use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+use http::{HeaderMap, Uri};
 
-use http::{StatusCode, Uri, header};
-use tracing::debug;
+/// How the client reacts to a 3xx response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedirectPolicy {
+    limit: usize,
+    allow_onion_to_clearnet: bool,
+}
 
-use crate::error::{Error, Result};
-use crate::response::Response;
-
-/// Redirect policy for HTTP requests
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RedirectPolicy {
-    /// Never follow redirects (safest)
-    #[default]
-    Never,
-    /// Follow up to N redirects with security checks
-    Limited(u32),
-    /// Follow any number of redirects (dangerous)
-    All,
+impl Default for RedirectPolicy {
+    fn default() -> Self {
+        Self::limited(10)
+    }
 }
 
 impl RedirectPolicy {
-    /// Follow up to 10 redirects (standard browser behavior)
-    #[must_use]
-    pub fn standard() -> Self {
-        Self::Limited(10)
+    /// Follow up to `limit` redirects.
+    pub fn limited(limit: usize) -> Self {
+        Self {
+            limit,
+            allow_onion_to_clearnet: false,
+        }
     }
 
-    /// Check if redirects should be followed
-    #[must_use]
-    pub fn should_follow(&self) -> bool {
-        !matches!(self, Self::Never)
+    /// Never follow redirects; return the 3xx response as-is.
+    pub fn none() -> Self {
+        Self {
+            limit: 0,
+            allow_onion_to_clearnet: false,
+        }
     }
 
-    /// Get the maximum number of redirects
-    #[must_use]
-    pub fn max_redirects(&self) -> Option<u32> {
-        match self {
-            Self::Never => Some(0),
-            Self::Limited(n) => Some(*n),
-            Self::All => None,
+    /// Permit a redirect from a `.onion` origin out to a clearnet host.
+    ///
+    /// # Warning
+    ///
+    /// Traffic to an onion service never leaves the Tor network and is
+    /// authenticated by the address itself. Following a redirect to clearnet
+    /// sends the follow-up request through an exit relay — an untrusted party
+    /// that sees the destination and, without TLS, the content. Only enable
+    /// this if you specifically expect such redirects.
+    pub fn allow_onion_to_clearnet(mut self, allow: bool) -> Self {
+        self.allow_onion_to_clearnet = allow;
+        self
+    }
+
+    /// Whether any redirect will be followed.
+    pub fn is_enabled(&self) -> bool {
+        self.limit > 0
+    }
+
+    /// The configured maximum.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Decide what to do with a redirect from `from` to `to`.
+    pub fn evaluate(&self, from: &Uri, to: &Uri) -> RedirectAction {
+        if self.limit == 0 {
+            return RedirectAction::Stop;
+        }
+
+        if is_onion(from) && !is_onion(to) && !self.allow_onion_to_clearnet {
+            return RedirectAction::Refuse(
+                "refusing to follow a redirect from an onion service to a clearnet host; \
+                 enable RedirectPolicy::allow_onion_to_clearnet if this is expected",
+            );
+        }
+
+        if same_origin(from, to) {
+            RedirectAction::Follow
+        } else {
+            RedirectAction::FollowStripped
         }
     }
 }
 
-/// Result of checking if a redirect should be followed
-#[derive(Debug)]
+/// The outcome of evaluating one redirect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectAction {
-    /// Follow the redirect to this URI
-    Follow(Uri),
-    /// Stop following redirects
+    /// Follow, keeping all headers.
+    Follow,
+    /// Follow, but drop credentials because the origin changed.
+    FollowStripped,
+    /// Do not follow; return the 3xx response to the caller.
     Stop,
+    /// Do not follow; fail with this explanation.
+    Refuse(&'static str),
 }
 
-/// Security checks for redirects
-#[derive(Debug, Clone)]
-pub struct RedirectGuard {
-    /// Maximum number of redirects
-    max_redirects: u32,
-    /// Current redirect count
-    count: u32,
-    /// Track visited URIs to prevent loops
-    visited: HashSet<String>,
-    /// Allow HTTP -> HTTPS upgrades only
-    allow_https_downgrade: bool,
-    /// Allow redirects to different hosts
-    allow_cross_origin: bool,
+/// Whether a URI names an onion service.
+pub(crate) fn is_onion(uri: &Uri) -> bool {
+    uri.host().is_some_and(|h| {
+        h.rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.eq_ignore_ascii_case("onion"))
+    })
 }
 
-impl Default for RedirectGuard {
-    fn default() -> Self {
-        Self {
-            max_redirects: 10,
-            count: 0,
-            visited: HashSet::new(),
-            allow_https_downgrade: false,
-            allow_cross_origin: true,
-        }
+/// Whether two URIs share a scheme, host and effective port.
+fn same_origin(a: &Uri, b: &Uri) -> bool {
+    fn port(uri: &Uri) -> Option<u16> {
+        uri.port_u16().or(match uri.scheme_str() {
+            Some("http") => Some(80),
+            Some("https") => Some(443),
+            _ => None,
+        })
     }
+
+    a.scheme_str() == b.scheme_str()
+        && a.host().map(str::to_ascii_lowercase) == b.host().map(str::to_ascii_lowercase)
+        && port(a) == port(b)
 }
 
-impl RedirectGuard {
-    /// Create a new redirect guard
-    #[must_use]
-    pub fn new(max_redirects: u32) -> Self {
-        Self {
-            max_redirects,
-            ..Default::default()
-        }
-    }
-
-    /// Disallow HTTPS -> HTTP downgrades
-    #[must_use]
-    pub fn forbid_https_downgrade(mut self) -> Self {
-        self.allow_https_downgrade = false;
-        self
-    }
-
-    /// Disallow cross-origin redirects
-    #[must_use]
-    pub fn forbid_cross_origin(mut self) -> Self {
-        self.allow_cross_origin = false;
-        self
-    }
-
-    /// Check if a redirect should be followed
-    pub fn check_redirect(
-        &mut self,
-        response: &Response,
-        current_uri: &Uri,
-    ) -> Result<RedirectAction> {
-        // Only follow redirect status codes
-        if !response.is_redirect() {
-            return Ok(RedirectAction::Stop);
-        }
-
-        // Check redirect limit
-        if self.count >= self.max_redirects {
-            return Err(Error::TooManyRedirects {
-                count: self.count,
-                limit: self.max_redirects,
-            });
-        }
-
-        // Get Location header
-        let location = response
-            .header(header::LOCATION.as_str())
-            .ok_or_else(|| Error::http("redirect response missing Location header"))?;
-
-        // Parse the redirect target
-        let target_uri = resolve_redirect_uri(current_uri, location)?;
-
-        // Check for redirect loops
-        let target_str = target_uri.to_string();
-        if self.visited.contains(&target_str) {
-            return Err(Error::http(format!(
-                "redirect loop detected: {} already visited",
-                target_str
-            )));
-        }
-
-        // Security: Check for HTTPS downgrade
-        if !self.allow_https_downgrade
-            && current_uri.scheme_str() == Some("https")
-            && target_uri.scheme_str() == Some("http")
-        {
-            return Err(Error::http(format!(
-                "refusing HTTPS to HTTP downgrade: {} -> {}",
-                current_uri, target_uri
-            )));
-        }
-
-        // Security: Check for cross-origin redirects
-        if !self.allow_cross_origin {
-            let current_host = current_uri.host();
-            let target_host = target_uri.host();
-            if current_host != target_host {
-                return Err(Error::http(format!(
-                    "refusing cross-origin redirect: {} -> {}",
-                    current_host.unwrap_or("unknown"),
-                    target_host.unwrap_or("unknown")
-                )));
-            }
-        }
-
-        // Track this redirect
-        self.visited.insert(target_str);
-        self.count += 1;
-
-        debug!(
-            "Following redirect {}/{}: {} -> {}",
-            self.count, self.max_redirects, current_uri, target_uri
-        );
-
-        Ok(RedirectAction::Follow(target_uri))
-    }
-
-    /// Get the number of redirects followed
-    #[must_use]
-    pub fn redirect_count(&self) -> u32 {
-        self.count
-    }
+/// Remove headers that must not cross an origin boundary.
+pub(crate) fn strip_sensitive_headers(headers: &mut HeaderMap) {
+    headers.remove(AUTHORIZATION);
+    headers.remove(PROXY_AUTHORIZATION);
+    headers.remove(COOKIE);
 }
 
-/// Resolve a redirect URI relative to the current URI
-fn resolve_redirect_uri(current: &Uri, location: &str) -> Result<Uri> {
-    // Try parsing as absolute URI first
-    if let Ok(uri) = location.parse::<Uri>() {
-        if uri.scheme().is_some() && uri.host().is_some() {
-            return Ok(uri);
-        }
+/// Resolve a `Location` value against the URI it was returned from.
+///
+/// Handles absolute URLs, absolute paths and relative paths.
+pub(crate) fn resolve(base: &Uri, location: &str) -> Option<Uri> {
+    let location = location.trim();
+    if location.is_empty() {
+        return None;
     }
 
-    // Parse as relative URI
-    if location.starts_with("//") {
-        // Protocol-relative URL
-        let scheme = current.scheme_str().unwrap_or("https");
-        let full_url = format!("{}:{}", scheme, location);
-        return full_url
-            .parse()
-            .map_err(|_| Error::invalid_url(&full_url, "invalid redirect URL"));
+    // Absolute URL.
+    if let Ok(uri) = location.parse::<Uri>()
+        && uri.scheme().is_some()
+    {
+        return Some(uri);
     }
 
-    if location.starts_with('/') {
-        // Absolute path
-        let scheme = current.scheme_str().unwrap_or("https");
-        let authority = current.authority().map(|a| a.as_str()).unwrap_or("");
-        let full_url = format!("{}://{}{}", scheme, authority, location);
-        return full_url
-            .parse()
-            .map_err(|_| Error::invalid_url(&full_url, "invalid redirect URL"));
-    }
+    let parts = base.clone().into_parts();
+    let scheme = parts.scheme?;
+    let authority = parts.authority?;
 
-    // Relative path - combine with current path
-    let scheme = current.scheme_str().unwrap_or("https");
-    let authority = current.authority().map(|a| a.as_str()).unwrap_or("");
-    let current_path = current.path();
-    let base_path = current_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-    let full_url = format!("{}://{}{}/{}", scheme, authority, base_path, location);
-    full_url
-        .parse()
-        .map_err(|_| Error::invalid_url(&full_url, "invalid redirect URL"))
-}
+    let path_and_query = if let Some(stripped) = location.strip_prefix("//") {
+        // Protocol-relative: //host/path
+        return format!("{}://{}", scheme.as_str(), stripped).parse().ok();
+    } else if location.starts_with('/') {
+        location.to_string()
+    } else {
+        // Relative to the base's directory.
+        let base_path = base.path();
+        let dir = match base_path.rfind('/') {
+            Some(i) => &base_path[..=i],
+            None => "/",
+        };
+        format!("{dir}{location}")
+    };
 
-/// Determine if headers should be removed on cross-origin redirect
-#[must_use]
-pub fn should_remove_auth_on_redirect(from: &Uri, to: &Uri) -> bool {
-    // Remove Authorization header on cross-origin redirects
-    from.host() != to.host()
-}
-
-/// Determine if the request method should change for this redirect
-#[must_use]
-pub fn redirect_method_for_status(
-    status: StatusCode,
-    original_method: &http::Method,
-) -> http::Method {
-    use http::Method;
-
-    match status.as_u16() {
-        // 301/302: Historically browsers changed POST to GET
-        301 | 302 => {
-            if *original_method == Method::POST {
-                Method::GET
-            } else {
-                original_method.clone()
-            }
-        }
-        // 303: Always change to GET (except HEAD)
-        303 => {
-            if *original_method == Method::HEAD {
-                Method::HEAD
-            } else {
-                Method::GET
-            }
-        }
-        // 307/308: Preserve method
-        307 | 308 => original_method.clone(),
-        // Unknown redirect status
-        _ => original_method.clone(),
-    }
+    format!(
+        "{}://{}{}",
+        scheme.as_str(),
+        authority.as_str(),
+        path_and_query
+    )
+    .parse()
+    .ok()
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    #[test]
-    fn test_redirect_policy() {
-        assert!(!RedirectPolicy::Never.should_follow());
-        assert!(RedirectPolicy::Limited(5).should_follow());
-        assert!(RedirectPolicy::All.should_follow());
-        assert_eq!(RedirectPolicy::standard().max_redirects(), Some(10));
+    fn uri(s: &str) -> Uri {
+        s.parse().expect("test URI parses")
     }
 
     #[test]
-    fn test_resolve_absolute_redirect() {
-        let current: Uri = "https://example.com/page".parse().unwrap();
-        let target = resolve_redirect_uri(&current, "https://other.com/new").unwrap();
-        assert_eq!(target.to_string(), "https://other.com/new");
-    }
-
-    #[test]
-    fn test_resolve_relative_redirect() {
-        let current: Uri = "https://example.com/foo/bar".parse().unwrap();
-        let target = resolve_redirect_uri(&current, "/baz").unwrap();
-        assert_eq!(target.to_string(), "https://example.com/baz");
-    }
-
-    #[test]
-    fn test_redirect_method_change() {
-        use http::Method;
-
-        // POST -> GET on 303
+    fn same_origin_redirects_keep_headers() {
+        let policy = RedirectPolicy::default();
         assert_eq!(
-            redirect_method_for_status(StatusCode::SEE_OTHER, &Method::POST),
-            Method::GET
+            policy.evaluate(&uri("http://a.onion/one"), &uri("http://a.onion/two")),
+            RedirectAction::Follow
         );
+    }
 
-        // POST preserved on 307
+    #[test]
+    fn cross_origin_redirects_drop_credentials() {
+        let policy = RedirectPolicy::default();
+        for (from, to) in [
+            ("http://a.onion/", "http://b.onion/"),
+            ("https://example.com/", "https://other.example.com/"),
+            ("http://example.com/", "https://example.com/"),
+            ("http://example.com/", "http://example.com:8080/"),
+        ] {
+            assert_eq!(
+                policy.evaluate(&uri(from), &uri(to)),
+                RedirectAction::FollowStripped,
+                "{from} -> {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_port_is_not_a_different_origin() {
+        let policy = RedirectPolicy::default();
         assert_eq!(
-            redirect_method_for_status(StatusCode::TEMPORARY_REDIRECT, &Method::POST),
-            Method::POST
+            policy.evaluate(&uri("http://a.onion/x"), &uri("http://a.onion:80/y")),
+            RedirectAction::Follow
         );
+    }
+
+    #[test]
+    fn onion_to_clearnet_is_refused_by_default() {
+        let policy = RedirectPolicy::default();
+        assert!(matches!(
+            policy.evaluate(&uri("http://a.onion/"), &uri("https://tracker.example/")),
+            RedirectAction::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn onion_to_clearnet_can_be_opted_into() {
+        let policy = RedirectPolicy::default().allow_onion_to_clearnet(true);
+        assert_eq!(
+            policy.evaluate(&uri("http://a.onion/"), &uri("https://example.com/")),
+            RedirectAction::FollowStripped
+        );
+    }
+
+    #[test]
+    fn clearnet_to_onion_is_always_allowed() {
+        // Moving *into* the Tor network is a security upgrade, not a downgrade.
+        let policy = RedirectPolicy::default();
+        assert_eq!(
+            policy.evaluate(&uri("https://example.com/"), &uri("http://a.onion/")),
+            RedirectAction::FollowStripped
+        );
+    }
+
+    #[test]
+    fn disabled_policy_stops() {
+        assert_eq!(
+            RedirectPolicy::none().evaluate(&uri("http://a.onion/"), &uri("http://a.onion/x")),
+            RedirectAction::Stop
+        );
+        assert!(!RedirectPolicy::none().is_enabled());
+    }
+
+    #[test]
+    fn strips_every_credential_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer secret".parse().unwrap());
+        headers.insert(COOKIE, "session=abc".parse().unwrap());
+        headers.insert(PROXY_AUTHORIZATION, "Basic xyz".parse().unwrap());
+        headers.insert("x-custom", "kept".parse().unwrap());
+
+        strip_sensitive_headers(&mut headers);
+
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert!(headers.get(COOKIE).is_none());
+        assert!(headers.get(PROXY_AUTHORIZATION).is_none());
+        assert!(headers.get("x-custom").is_some());
+    }
+
+    #[test]
+    fn resolves_absolute_locations() {
+        let base = uri("http://a.onion/dir/page");
+        assert_eq!(
+            resolve(&base, "https://b.onion/x").unwrap(),
+            uri("https://b.onion/x")
+        );
+    }
+
+    #[test]
+    fn resolves_absolute_paths() {
+        let base = uri("http://a.onion/dir/page?q=1");
+        assert_eq!(
+            resolve(&base, "/other").unwrap(),
+            uri("http://a.onion/other")
+        );
+    }
+
+    #[test]
+    fn resolves_relative_paths_against_the_directory() {
+        let base = uri("http://a.onion/dir/page");
+        assert_eq!(
+            resolve(&base, "sibling").unwrap(),
+            uri("http://a.onion/dir/sibling")
+        );
+    }
+
+    #[test]
+    fn resolves_protocol_relative_locations() {
+        let base = uri("https://a.example/dir/page");
+        assert_eq!(
+            resolve(&base, "//b.example/x").unwrap(),
+            uri("https://b.example/x")
+        );
+    }
+
+    #[test]
+    fn empty_location_is_not_a_redirect() {
+        assert!(resolve(&uri("http://a.onion/"), "   ").is_none());
     }
 }

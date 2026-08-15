@@ -1,500 +1,224 @@
-"""Type stubs for hypertor."""
+"""Type stubs for the hypertor extension module."""
 
-from typing import Optional, Callable, Any, Dict, List, TypeVar, Union
+from types import TracebackType
+from typing import Any, Callable, Literal, TypeVar
 
-T = TypeVar('T')
+__version__: str
 
-# =============================================================================
-# HTTP CLIENT
-# =============================================================================
+_Handler = TypeVar("_Handler", bound=Callable[..., Any])
+
+Isolation = Literal["none", "per_host", "per_request"]
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class HypertorError(Exception):
+    """Base class for every hypertor error."""
+
+class ConnectionError(HypertorError):
+    """Tor could not bootstrap, or the target could not be reached."""
+
+class TimeoutError(HypertorError):
+    """An operation exceeded its deadline."""
+
+class TlsError(HypertorError):
+    """A TLS handshake or configuration failure."""
+
+# ---------------------------------------------------------------------------
+# Responses
+# ---------------------------------------------------------------------------
 
 class Response:
-    """HTTP response from a Tor request."""
+    """An HTTP response with its body already read."""
 
     @property
-    def status(self) -> int:
-        """HTTP status code."""
-        ...
+    def status_code(self) -> int: ...
+    @property
+    def ok(self) -> bool:
+        """Whether the status is 2xx."""
 
     @property
     def headers(self) -> dict[str, str]:
-        """Response headers."""
-        ...
+        """Response headers, lowercased."""
 
+    @property
+    def content(self) -> bytes:
+        """The raw response body."""
+
+    @property
     def text(self) -> str:
-        """Response body as text."""
-        ...
+        """The body decoded as UTF-8."""
 
-    def bytes(self) -> bytes:
-        """Response body as bytes."""
-        ...
+    def json(self) -> Any:
+        """The body parsed as JSON."""
 
-    def json(self) -> object:
-        """Response body parsed as JSON."""
-        ...
+    def raise_for_status(self) -> Response:
+        """Raise :class:`HypertorError` if the status is not 2xx."""
 
-    def __len__(self) -> int:
-        """Length of response body."""
-        ...
+    def __len__(self) -> int: ...
+    def __repr__(self) -> str: ...
 
-    def __repr__(self) -> str:
-        """String representation."""
-        ...
+# ---------------------------------------------------------------------------
+# Clients
+# ---------------------------------------------------------------------------
 
 class Client:
-    """Synchronous Tor HTTP client.
-    
-    Example:
-        >>> with hypertor.Client() as client:
-        ...     response = client.get("http://example.onion")
-        ...     print(response.text())
+    """A synchronous HTTP client that sends every request over Tor.
+
+    Constructing one bootstraps Tor, which can take tens of seconds on a cold
+    cache. Reuse a single client rather than creating one per request.
     """
 
     def __init__(
-        self, 
-        timeout: int = 30, 
-        max_connections: int = 10
-    ) -> None:
-        """Create a new Tor client. Blocks until Tor bootstraps.
-        
-        Args:
-            timeout: Request timeout in seconds (default: 30)
-            max_connections: Maximum pooled connections (default: 10)
-        """
-        ...
-
-    def __enter__(self) -> "Client":
-        ...
-
-    def __exit__(self, *args: object) -> None:
-        ...
-
-    def get(self, url: str) -> Response:
-        """Make a GET request."""
-        ...
-
+        self,
+        timeout: float = 30.0,
+        max_idle_per_host: int = 4,
+        isolation: Isolation = "per_host",
+        user_agent: str | None = None,
+        verify: bool = True,
+    ) -> None: ...
+    def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
     def post(
         self,
         url: str,
         *,
-        body: Optional[bytes] = None,
-        json: Optional[str] = None,
-        data: Optional[dict[str, str]] = None,
-    ) -> Response:
-        """Make a POST request.
-        
-        Args:
-            url: Request URL
-            body: Raw bytes body
-            json: Pre-serialized JSON string body
-            data: Form data (URL-encoded)
-        """
-        ...
-
+        body: bytes | None = None,
+        json: Any | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
     def put(
         self,
         url: str,
         *,
-        body: Optional[bytes] = None,
-        json: Optional[str] = None,
-        data: Optional[dict[str, str]] = None,
-    ) -> Response:
-        """Make a PUT request."""
-        ...
+        body: bytes | None = None,
+        json: Any | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
+    def delete(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
+    def resolve(self, hostname: str) -> list[str]:
+        """Resolve a hostname through Tor, never locally."""
 
-    def delete(self, url: str) -> Response:
-        """Make a DELETE request."""
-        ...
-
-    def pool_size(self) -> int:
-        """Get the number of pooled connections."""
-        ...
-
-    def clear_pool(self) -> None:
-        """Clear the connection pool."""
-        ...
+    def __enter__(self) -> Client: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> bool: ...
 
 class AsyncClient:
-    """Asynchronous Tor HTTP client.
-    
-    Example:
-        >>> async with hypertor.AsyncClient() as client:
-        ...     response = await client.get("http://example.onion")
-        ...     print(response.text())
-    """
+    """An asyncio-compatible HTTP client that sends every request over Tor."""
 
     def __init__(
-        self, 
-        timeout: int = 30, 
-        max_connections: int = 10
-    ) -> None:
-        """Create a new async Tor client (sync bootstrap)."""
-        ...
-
-    async def __aenter__(self) -> "AsyncClient":
-        ...
-
-    async def __aexit__(self, *args: object) -> None:
-        ...
-
-    @staticmethod
-    async def create(
-        timeout: int = 30, 
-        max_connections: int = 10
-    ) -> "AsyncClient":
-        """Create a new async Tor client with async bootstrap."""
-        ...
-
-    async def get(self, url: str) -> Response:
-        """Make a GET request."""
-        ...
-
+        self,
+        timeout: float = 30.0,
+        max_idle_per_host: int = 4,
+        isolation: Isolation = "per_host",
+        user_agent: str | None = None,
+        verify: bool = True,
+    ) -> None: ...
+    async def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
     async def post(
         self,
         url: str,
         *,
-        body: Optional[bytes] = None,
-        json: Optional[str] = None,
-        data: Optional[dict[str, str]] = None,
-    ) -> Response:
-        """Make a POST request."""
-        ...
+        body: bytes | None = None,
+        json: Any | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
+    async def put(
+        self,
+        url: str,
+        *,
+        body: bytes | None = None,
+        json: Any | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
+    async def delete(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Response: ...
+    async def __aenter__(self) -> AsyncClient: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> bool: ...
 
-    def pool_size(self) -> int:
-        """Get the number of pooled connections."""
-        ...
-
-
-# =============================================================================
-# ONION SERVICE (FastAPI-like)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Onion services
+# ---------------------------------------------------------------------------
 
 class Request:
-    """HTTP request object passed to route handlers.
-    
-    Attributes:
-        method: HTTP method (GET, POST, etc.)
-        path: Request path
-        params: Path parameters extracted from route pattern
-        query: Query string parameters
-        headers: Request headers
-    """
-    
-    method: str
-    path: str
-    params: Dict[str, str]
-    query: Dict[str, str]
-    headers: Dict[str, str]
-    
-    def text(self) -> str:
-        """Get request body as text."""
-        ...
-    
-    def json(self) -> Any:
-        """Get request body parsed as JSON."""
-        ...
-    
-    def body(self) -> bytes:
-        """Get request body as bytes."""
-        ...
-    
-    def header(self, name: str) -> Optional[str]:
-        """Get a specific header by name."""
-        ...
-    
-    def query_param(self, name: str) -> Optional[str]:
-        """Get a specific query parameter."""
-        ...
-    
-    def path_param(self, name: str) -> Optional[str]:
-        """Get a specific path parameter."""
-        ...
+    """A request handed to an OnionApp handler."""
 
+    @property
+    def method(self) -> str: ...
+    @property
+    def path(self) -> str: ...
+    @property
+    def query(self) -> dict[str, str]: ...
+    @property
+    def params(self) -> dict[str, str]:
+        """Path parameters captured by the route pattern."""
 
-class AppResponse:
-    """HTTP response for route handlers.
-    
-    Example:
-        >>> return AppResponse("Hello", status=200)
-        >>> return AppResponse.json({"key": "value"})
-        >>> return AppResponse.html("<h1>Hello</h1>")
-    """
-    
-    status: int
-    
-    def __init__(
-        self,
-        body: Union[str, bytes, Any],
-        status: int = 200,
-        content_type: str = "text/plain"
-    ) -> None:
-        """Create a new response.
-        
-        Args:
-            body: Response body (str, bytes, or JSON-serializable)
-            status: HTTP status code
-            content_type: Content-Type header
-        """
-        ...
-    
-    @staticmethod
-    def json(data: Any, status: Optional[int] = None) -> "AppResponse":
-        """Create JSON response."""
-        ...
-    
-    @staticmethod
-    def html(content: str, status: Optional[int] = None) -> "AppResponse":
-        """Create HTML response."""
-        ...
-    
-    @staticmethod
-    def redirect(location: str, status: Optional[int] = None) -> "AppResponse":
-        """Create redirect response."""
-        ...
-    
-    def set_header(self, name: str, value: str) -> None:
-        """Add a response header."""
-        ...
-    
-    def get_headers(self) -> Dict[str, str]:
-        """Get all response headers."""
-        ...
-
-
-class AppConfig:
-    """Configuration for OnionApp.
-    
-    Attributes:
-        port: Virtual port for .onion address (default: 80)
-        debug: Enable debug mode
-        log_requests: Enable request logging
-        timeout: Request timeout in seconds
-        max_body_size: Max request body size in bytes
-        key_file: Path to key file for persistent .onion address
-        enable_pow: Enable Proof-of-Work protection
-        security_level: "standard", "enhanced", "maximum", or "paranoid"
-    """
-    
-    port: int
-    debug: bool
-    log_requests: bool
-    timeout: int
-    max_body_size: int
-    key_file: Optional[str]
-    enable_pow: bool
-    security_level: str
-    
-    def __init__(
-        self,
-        port: int = 80,
-        debug: bool = False,
-        log_requests: bool = True,
-        timeout: int = 30,
-        max_body_size: int = 10485760,
-        key_file: Optional[str] = None,
-        enable_pow: bool = False,
-        security_level: str = "standard"
-    ) -> None:
-        """Create app configuration.
-        
-        Args:
-            port: Virtual port (default: 80)
-            debug: Enable debug mode
-            log_requests: Log incoming requests
-            timeout: Request timeout in seconds
-            max_body_size: Max body size (default: 10MB)
-            key_file: Path for persistent .onion address
-            enable_pow: Enable Proof-of-Work DoS protection
-            security_level: Security preset ("standard", "enhanced", "maximum", "paranoid")
-        """
-        ...
-
+    @property
+    def headers(self) -> dict[str, str]: ...
+    @property
+    def body(self) -> bytes: ...
+    def text(self) -> str: ...
+    def json(self) -> Any: ...
 
 class OnionApp:
-    """FastAPI-like onion service application.
-    
-    Example:
-        >>> app = OnionApp()
-        >>> 
-        >>> @app.get("/")
-        ... def home():
-        ...     return "Welcome to my .onion service!"
-        >>> 
-        >>> @app.post("/api/echo")
-        ... def echo(request: Request):
-        ...     return {"received": request.json()}
-        >>> 
-        >>> @app.get("/users/{user_id}")
-        ... def get_user(user_id: int):
-        ...     return {"id": user_id, "name": "Alice"}
-        >>> 
-        >>> app.run()  # 🧅 Service live at: xyz...xyz.onion
+    """A FastAPI-shaped onion service.
+
+    Pass ``state_dir`` to keep the same ``.onion`` address across restarts;
+    without it the service gets a new address every time it starts.
     """
-    
+
     def __init__(
         self,
-        config: Optional[AppConfig] = None,
+        nickname: str = "hypertor",
+        *,
         port: int = 80,
-        debug: bool = False,
-        key_file: Optional[str] = None
-    ) -> None:
-        """Create a new OnionApp.
-        
-        Args:
-            config: Optional AppConfig object
-            port: Port number (default: 80)
-            debug: Enable debug mode
-            key_file: Path to key file for persistent address
-        """
-        ...
-    
-    def get(
-        self, 
-        path: str, 
-        response_model: Optional[str] = None
-    ) -> Callable[[T], T]:
-        """Register a GET route handler.
-        
-        Usage:
-            @app.get("/")
-            def home():
-                return "Hello!"
-        """
-        ...
-    
-    def post(
-        self, 
-        path: str, 
-        response_model: Optional[str] = None
-    ) -> Callable[[T], T]:
-        """Register a POST route handler."""
-        ...
-    
-    def put(
-        self, 
-        path: str, 
-        response_model: Optional[str] = None
-    ) -> Callable[[T], T]:
-        """Register a PUT route handler."""
-        ...
-    
-    def delete(
-        self, 
-        path: str, 
-        response_model: Optional[str] = None
-    ) -> Callable[[T], T]:
-        """Register a DELETE route handler."""
-        ...
-    
-    def patch(
-        self, 
-        path: str, 
-        response_model: Optional[str] = None
-    ) -> Callable[[T], T]:
-        """Register a PATCH route handler."""
-        ...
-    
-    def route(
-        self,
-        path: str,
-        methods: Optional[List[str]] = None,
-        response_model: Optional[str] = None
-    ) -> Callable[[T], T]:
-        """Register a route with explicit method(s).
-        
-        Usage:
-            @app.route("/path", methods=["GET", "POST"])
-            def handler(request):
-                return "response"
-        """
-        ...
-    
-    def middleware(self, func: T) -> T:
-        """Add middleware.
-        
-        Usage:
-            @app.middleware
-            async def log_request(request, call_next):
-                print(f"Request: {request.path}")
-                response = await call_next(request)
-                return response
-        """
-        ...
-    
-    def error_handler(self, status_code: int) -> Callable[[T], T]:
-        """Register error handler for specific status code.
-        
-        Usage:
-            @app.error_handler(404)
-            def not_found(request):
-                return {"error": "Not found"}
-        """
-        ...
-    
-    def on_startup(self, func: T) -> T:
-        """Register startup hook."""
-        ...
-    
-    def on_shutdown(self, func: T) -> T:
-        """Register shutdown hook."""
-        ...
-    
-    def routes_info(self) -> List[Dict[str, str]]:
-        """Get registered routes (for debugging)."""
-        ...
-    
-    def address(self) -> Optional[str]:
-        """Get the .onion address (available after run())."""
-        ...
-    
-    def is_running(self) -> bool:
-        """Check if app is running."""
-        ...
-    
-    def stop(self) -> None:
-        """Stop the app."""
-        ...
-    
-    def run(
-        self,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        reload: bool = False
-    ) -> None:
-        """Run the onion service.
-        
-        This starts the Tor connection, publishes the service descriptor,
-        and begins accepting connections. Blocks until stopped.
-        
-        Args:
-            host: Ignored (for FastAPI compatibility)
-            port: Ignored (uses config.port)
-            reload: Enable auto-reload (not implemented)
-        """
-        ...
-
-
-# =============================================================================
-# EXCEPTIONS
-# =============================================================================
-
-class HypertorError(Exception):
-    """Base exception for hypertor errors."""
-    ...
-
-class TorBootstrapError(HypertorError):
-    """Failed to bootstrap Tor connection."""
-    ...
-
-class ConnectionError(HypertorError):
-    """Failed to connect through Tor."""
-    ...
-
-class TimeoutError(HypertorError):
-    """Request or operation timed out."""
-    ...
-
-class TlsError(HypertorError):
-    """TLS/SSL error."""
-    ...
-
+        state_dir: str | None = None,
+    ) -> None: ...
+    def get(self, path: str) -> Callable[[_Handler], _Handler]: ...
+    def post(self, path: str) -> Callable[[_Handler], _Handler]: ...
+    def put(self, path: str) -> Callable[[_Handler], _Handler]: ...
+    def delete(self, path: str) -> Callable[[_Handler], _Handler]: ...
+    def run(self) -> None:
+        """Publish the service and serve until interrupted."""
